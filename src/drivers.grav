@@ -49,7 +49,7 @@ namespace apogee {
         fn needsSleep() -> bool { return true; }
     }
 
-    class MemoryEntry {
+    class QueuedMemoryEntry {
         public id: string
         public payload: string
         public attempts: int
@@ -58,10 +58,10 @@ namespace apogee {
         constructor(id: string, payload: string, attempts: int, availableAt: long) { self.id = id; self.payload = payload; self.attempts = attempts; self.availableAt = availableAt; }
     }
     class MemoryQueueLane {
-        public ready: Deque<MemoryEntry>
-        public delayed: Array<MemoryEntry>
-        public reserved: HashMap<string, MemoryEntry>
-        constructor() { self.ready = new Deque<MemoryEntry>(); self.delayed = new Array<MemoryEntry>(); self.reserved = new HashMap<string, MemoryEntry>(); }
+        public ready: Deque<QueuedMemoryEntry>
+        public delayed: Array<QueuedMemoryEntry>
+        public reserved: HashMap<string, QueuedMemoryEntry>
+        constructor() { self.ready = new Deque<QueuedMemoryEntry>(); self.delayed = new Array<QueuedMemoryEntry>(); self.reserved = new HashMap<string, QueuedMemoryEntry>(); }
     }
 
     // Jobs in this process's memory: tests, and one-process apps whose workers
@@ -80,7 +80,7 @@ namespace apogee {
         fn push(queue: string, payload: string, delaySeconds: long) -> string {
             let id = "${self.counter.increment()}";
             let now = Time.nowMs();
-            let e = new MemoryEntry(id, payload, 0, now + delaySeconds * 1000);
+            let e = new QueuedMemoryEntry(id, payload, 0, now + delaySeconds * 1000);
             self.lock.lock();
             let l = self.lane(queue);
             if (delaySeconds > 0) { MemoryQueueDriver.insertDelayed(l, e); } else { l.ready.pushBack(e); }
@@ -88,7 +88,7 @@ namespace apogee {
             return id;
         }
         // (kept in due order, so moving due ones is a scan from the front)
-        private static fn insertDelayed(l: MemoryQueueLane, e: MemoryEntry) {
+        private static fn insertDelayed(l: MemoryQueueLane, e: QueuedMemoryEntry) {
             let i = l.delayed.size();
             while (i > 0 && l.delayed[i - 1].availableAt > e.availableAt) { i -= 1; }
             l.delayed.insert(i, e);
@@ -103,7 +103,7 @@ namespace apogee {
             if (due > 0) { l.delayed = l.delayed.slice(due, l.delayed.size()); }
             if (l.reserved.size() > 0) {
                 let lapsed = new Array<string>();
-                l.reserved.forEach(fn(id: string, e: MemoryEntry) { if (e.reservedUntil <= now) { lapsed.push(id); } });
+                l.reserved.forEach(fn(id: string, e: QueuedMemoryEntry) { if (e.reservedUntil <= now) { lapsed.push(id); } });
                 for (id in lapsed) { let e = l.reserved[id]; l.reserved.remove(id); e.reservedUntil = 0; l.ready.pushBack(e); }
             }
             if (l.ready.isEmpty()) { self.lock.unlock(); return null; }
