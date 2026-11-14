@@ -1,0 +1,415 @@
+// worker.grav — Worker: takes jobs off queues and runs them, as `queue:work`.
+//
+//   let w = queue.worker()
+//   w.work("redis", ["high", "default"], new WorkerOptions())     // until told to stop
+//   w.workConcurrently(8, "redis", ["default"], options)           // 8 threads
+//   w.runNextJob("redis", ["default"], options)                    // one job (tests, cron)
+//
+// For each job: fail it at once if it is out of attempts or past retryUntil;
+// otherwise rebuild it, run handle() through its middleware (inside a
+// container scope: one per job), with a timeout. Then: done (delete, the next
+// link of its chain, its batch's counts), released (back with a delay), or
+// failed (recorded; failed() and the chain's or batch's catch run). The loop
+// stops on SIGTERM/SIGINT/SIGQUIT (after the job in hand), `queue:restart`,
+// too much memory, maxJobs or maxTime; SIGUSR2 pauses it and SIGCONT resumes.
+import "std"
+import "apogee-container"
+import "apogee-support"
+import "grav-cache"
+import "job.grav"
+import "payload.grav"
+import "drivers.grav"
+import "manager.grav"
+import "events.grav"
+
+namespace apogee {
+
+    class WorkerOptions {
+        public name: string = "default"
+        // Seconds to wait when every queue is empty.
+        public sleep: double = 3.0
+        // Attempts for jobs that do not say (job.tries).
+        public tries: int = 1
+        // Seconds an attempt may take for jobs that do not say (0: no limit).
+        public timeout: int = 60
+        // Seconds before each retry, for jobs that do not say.
+        public backoff: Array<int>
+        // Seconds a popped job stays reserved before another worker may take it (keep it above timeout).
+        public retryAfter: long = 90
+        // Stop after this many jobs / seconds (0: no limit).
+        public maxJobs: int = 0
+        public maxTime: long = 0
+        // Stop when the process holds more than this many megabytes (0: no limit).
+        public memoryMb: long = 128
+        // Stop when the queues are empty (queue:work --stop-when-empty).
+        public stopWhenEmpty: bool = false
+        // Milliseconds to rest between jobs.
+        public restMs: long = 0
+        // Catch SIGTERM/SIGINT/SIGQUIT/SIGUSR2/SIGCONT (a worker process; not in tests).
+        public trapSignals: bool = false
+        // Where each job's line goes (null: nowhere).
+        public output: fn(string) = null
+        constructor() { self.backoff = [0]; }
+    }
+
+    // What a worker has done.
+    class WorkerStats {
+        public processed: long = 0
+        public failed: long = 0
+        public released: long = 0
+        public startedAt: long = 0
+        // Milliseconds spent running jobs, by job name.
+        public runtime: HashMap<string, long>
+        public counts: HashMap<string, long>
+        constructor() { self.runtime = new HashMap<string, long>(); self.counts = new HashMap<string, long>(); self.startedAt = Time.nowMs(); }
+        // The average milliseconds a job of `name` takes.
+        fn averageMs(name: string) -> double { let n = self.counts.getOr(name, 0); return n == 0 ? 0.0 : (self.runtime.getOr(name, 0) as double) / (n as double); }
+    }
+
+    // One reusable thread for running jobs with a timeout (a thread per job costs more).
+    class JobRunner {
+        private tasks: Channel<fn()>
+        private thread: Thread
+        constructor() {
+            self.tasks = new Channel<fn()>(1);
+            let tasks = self.tasks;
+            self.thread = Thread.spawn("queue-runner", fn() {
+                while (tasks.hasNext()) { let t = tasks.receive(); t(); }
+            });
+        }
+        // Runs `f` there; whether it finished within `ms`.
+        fn run(f: fn(), ms: long) -> bool {
+            let done = new CountDownLatch(1);
+            self.tasks.send(fn() { try { f(); } finally { done.countDown(); } });
+            return done.waitFor(ms as int);
+        }
+        fn close() { self.tasks.close(); }
+    }
+
+    class Worker {
+        public manager: QueueManager
+        public stats: WorkerStats
+        // Set to stop after the job in hand.
+        public shouldQuit: bool = false
+        public paused: bool = false
+        public exitCode: int = 0
+        // The exception of the last sync job that failed.
+        public lastError: Exception = null
+        private runner: JobRunner = null
+        private startedAt: long = 0
+
+        static restartKey: string = "apogee:queue:restart"
+
+        constructor(manager: QueueManager) { self.manager = manager; self.stats = new WorkerStats(); }
+
+        // Tells every worker sharing the manager's cache to stop after its current job (queue:restart).
+        static fn signalRestart(cache: CacheRepository) { cache.forever(Worker.restartKey, Time.nowMs()); }
+
+        // ── the loop ───────────────────────────────────────────────────────────
+        // Works until told to stop; the exit code (0: fine, 12: too much memory, 1: a job timed out).
+        fn work(connection: string = "", queues: Array<string> = new Array<string>(), options: WorkerOptions = new WorkerOptions()) -> int {
+            let conn = connection == "" ? self.manager.defaultConnection : connection;
+            let qs = queues.size() == 0 ? [self.manager.defaultQueue] as Array<string> : queues;
+            self.startedAt = Time.nowMs();
+            self.shouldQuit = false;
+            self.exitCode = 0;
+            if (options.trapSignals) { Process.trapSignals([Process.SIGTERM(), Process.SIGINT(), Process.SIGQUIT(), Process.SIGUSR2(), 18]); }
+            let restartAtStart = self.restartStamp();
+            let jobs = 0;
+            self.manager.fire(new WorkerStarting(options.name, conn, Str.join(qs, ",")));
+            while (!self.shouldQuit) {
+                if (options.trapSignals) { self.readSignals(); }
+                if (self.paused) { Time.sleepMs(200); continue; }
+                let ran = self.runNextJob(conn, qs, options);
+                if (ran) { jobs += 1; }
+                if (self.stopReason(options, jobs, restartAtStart, ran) != "") { break; }
+                if (!ran) {
+                    if (self.manager.connection(conn).needsSleep()) { Time.sleepMs((options.sleep * 1000.0) as long); }
+                } else if (options.restMs > 0) { Time.sleepMs(options.restMs); }
+            }
+            self.manager.fire(new WorkerStopping(options.name, self.exitCode));
+            if (self.runner != null) { self.runner.close(); self.runner = null; }
+            return self.exitCode;
+        }
+        private fn readSignals() {
+            let s = Process.signalReceived();
+            if (s == Process.SIGTERM() || s == Process.SIGINT() || s == Process.SIGQUIT()) { self.shouldQuit = true; }
+            else if (s == Process.SIGUSR2()) { self.paused = true; }
+            else if (s == 18) { self.paused = false; }
+        }
+        // Why the loop stops now ("" to go on).
+        private fn stopReason(o: WorkerOptions, jobs: int, restartAtStart: long, ran: bool) -> string {
+            if (self.shouldQuit) { return "stopped"; }
+            if (o.maxJobs > 0 && jobs >= o.maxJobs) { self.shouldQuit = true; return "max jobs"; }
+            if (o.maxTime > 0 && Time.nowMs() - self.startedAt >= o.maxTime * 1000) { self.shouldQuit = true; return "max time"; }
+            if (o.memoryMb > 0 && Process.memoryUsage() / 1048576 >= o.memoryMb) { self.shouldQuit = true; self.exitCode = 12; return "memory"; }
+            if (!ran && o.stopWhenEmpty) { self.shouldQuit = true; return "empty"; }
+            if (self.restartStamp() != restartAtStart) { self.shouldQuit = true; return "restart"; }
+            return "";
+        }
+        private fn restartStamp() -> long { let v = self.manager.cache.get(Worker.restartKey); return v == null ? 0 : Integer.parseOr(str(v), 0); }
+        fn stop() { self.shouldQuit = true; }
+
+        // `threads` workers in this process (each its own thread), sharing the
+        // manager; returns when they all stop. Their stats are summed into this one's.
+        fn workConcurrently(threads: int, connection: string = "", queues: Array<string> = new Array<string>(), options: WorkerOptions = new WorkerOptions()) -> int {
+            self.shouldQuit = false;
+            let workers = new Array<Worker>();
+            let pool = new Array<Thread>();
+            for (i in 0..threads) {
+                let w = new Worker(self.manager);
+                workers.push(w);
+                pool.push(Thread.spawn("queue-worker-${i}", fn() { w.work(connection, queues, options); }));
+            }
+            // (a stop() on this worker reaches the others)
+            while (true) {
+                let alive = false;
+                for (w in workers) { if (!w.shouldQuit) { alive = true; } }
+                if (!alive) { break; }
+                if (self.shouldQuit) { for (w in workers) { w.stop(); } }
+                if (options.trapSignals) { self.readSignals(); }
+                Time.sleepMs(50);
+            }
+            for (t in pool) { t.join(); }
+            let code = 0;
+            for (w in workers) {
+                self.stats.processed += w.stats.processed;
+                self.stats.failed += w.stats.failed;
+                self.stats.released += w.stats.released;
+                if (w.exitCode != 0) { code = w.exitCode; }
+            }
+            return code;
+        }
+
+        // Takes the first due job from `queues` (in order: earlier ones first) and
+        // runs it; whether there was one.
+        fn runNextJob(connection: string, queues: Array<string>, options: WorkerOptions) -> bool {
+            let driver = self.manager.connection(connection);
+            for (q in queues) {
+                let reserved = driver.pop(q, options.retryAfter);
+                if (reserved != null) { self.process(connection, driver, reserved, options); return true; }
+            }
+            return false;
+        }
+
+        // ── one job ────────────────────────────────────────────────────────────
+        fn process(connection: string, driver: QueueDriver, reserved: ReservedJob, options: WorkerOptions) {
+            let p: Payload = null;
+            try { p = JobCodec.read(reserved.payload); }
+            catch (e: Exception) {
+                // (a payload nobody can read: kept as a failure, not retried forever)
+                driver.delete(reserved);
+                self.manager.failedJobs.record(connection, reserved.queue, reserved.payload, "unreadable payload: " + e.message());
+                self.stats.failed += 1;
+                return;
+            }
+            let name = p.displayName;
+            let maxTries = p.maxTries > 0 ? p.maxTries : options.tries;
+            self.manager.fire(new JobProcessing(connection, reserved.queue, name, reserved.id, reserved.attempts));
+            if (maxTries > 0 && reserved.attempts > maxTries) {
+                self.failJob(connection, driver, reserved, p, null, new MaxAttemptsExceededException(name + " has been attempted too many times (${maxTries})"));
+                return;
+            }
+            if (p.retryUntil > 0 && Time.now() > p.retryUntil) {
+                self.failJob(connection, driver, reserved, p, null, new MaxAttemptsExceededException(name + " is past its retryUntil"));
+                return;
+            }
+            let job: Job = null;
+            try { job = JobCodec.rebuild(p); }
+            catch (e: ModelNotFoundException) {
+                if (p.data.has("deleteWhenMissingModels") && p.data.get("deleteWhenMissingModels").asBool()) { driver.delete(reserved); self.finishedOne(p, true); return; }
+                self.failJob(connection, driver, reserved, p, null, e);
+                return;
+            } catch (e: Exception) { self.failJob(connection, driver, reserved, p, null, e); return; }
+            let state = new JobState();
+            state.id = reserved.id;
+            state.attempts = reserved.attempts;
+            state.queue = reserved.queue;
+            state.connection = connection;
+            state.batchId = p.batchId;
+            state.batches = self.manager.batches;
+            job.state = state;
+            if (job.uniqueUntilProcessing() && job.uniqueId() != "") { self.manager.cache.forget(QueueManager.uniqueKey(job)); }
+
+            let started = Time.nowMs();
+            let timeout = p.timeout > 0 ? p.timeout : options.timeout;
+            let error = self.runHandle(job, timeout);
+            let ms = Time.nowMs() - started;
+            self.say(options, name, error == null && state.failure == null ? (state.released ? "RELEASED" : "DONE") : "FAIL", ms);
+
+            if (error is TimeoutExceededException) {
+                // (the stuck attempt keeps its thread: this worker stops, as Laravel's does, for its supervisor to start a fresh one)
+                self.runner = null;
+                self.shouldQuit = true;
+                self.exitCode = 1;
+                self.manager.fire(new JobTimedOut(connection, reserved.queue, name, reserved.id));
+                if (p.failOnTimeout || reserved.attempts >= maxTries) { self.failJob(connection, driver, reserved, p, job, error); }
+                else { self.releaseJob(connection, driver, reserved, p, job, error, options); }
+                return;
+            }
+            if (state.failure != null) { self.failJob(connection, driver, reserved, p, job, state.failure); return; }
+            if (error != null) {
+                self.manager.fire(new JobExceptionOccurred(connection, reserved.queue, name, reserved.id, error));
+                let tooManyExceptions = false;
+                if (p.maxExceptions > 0) {
+                    let count = self.manager.cache.increment("job-exceptions:" + p.uuid, 1);
+                    tooManyExceptions = count >= (p.maxExceptions as long);
+                }
+                if ((maxTries > 0 && reserved.attempts >= maxTries) || tooManyExceptions) { self.failJob(connection, driver, reserved, p, job, error); }
+                else { self.releaseJob(connection, driver, reserved, p, job, error, options); }
+                return;
+            }
+            if (state.released) {
+                driver.release(reserved, state.releaseDelay);
+                self.stats.released += 1;
+                self.manager.fire(new JobReleased(connection, reserved.queue, name, reserved.id, state.releaseDelay));
+                return;
+            }
+            driver.delete(reserved);
+            self.record(name, ms);
+            self.stats.processed += 1;
+            if (!state.deleted) {
+                self.manager.fire(new JobProcessed(connection, reserved.queue, name, reserved.id, ms));
+                self.nextInChain(p);
+            }
+            if (p.maxExceptions > 0) { self.manager.cache.forget("job-exceptions:" + p.uuid); }
+            if (job.uniqueId() != "" && !job.uniqueUntilProcessing()) { self.manager.cache.forget(QueueManager.uniqueKey(job)); }
+            self.finishedOne(p, false);
+        }
+        // Runs the job's middleware and handle() in a scope of its own; the exception it threw, or null.
+        private fn runHandle(job: Job, timeoutSeconds: int) -> Exception {
+            let container = self.manager.container;
+            let failure = new Array<Exception>();
+            let body = fn() {
+                let scope = container.scope();
+                try {
+                    scope.provideNamed(nameof(Job), job);
+                    Worker.throughMiddleware(job, job.middleware(), 0, fn(j: Job) { scope.call(j, "handle"); });
+                } catch (e: Exception) { failure.push(e); }
+                finally { scope.dispose(); }
+            };
+            if (timeoutSeconds <= 0) { body(); }
+            else {
+                if (self.runner == null) { self.runner = new JobRunner(); }
+                if (!self.runner.run(body, (timeoutSeconds as long) * 1000)) {
+                    return new TimeoutExceededException(job.displayName() + " took longer than ${timeoutSeconds} second(s)");
+                }
+            }
+            return failure.size() > 0 ? failure[0] : null;
+        }
+        private static fn throughMiddleware(job: Job, list: Array<JobMiddleware>, i: int, last: fn(Job)) {
+            if (i >= list.size()) { last(job); return; }
+            let m = list[i];
+            m.handle(job, fn(j: Job) { Worker.throughMiddleware(j, list, i + 1, last); });
+        }
+        private fn releaseJob(connection: string, driver: QueueDriver, reserved: ReservedJob, p: Payload, job: Job, e: Exception, options: WorkerOptions) {
+            let delay = job != null ? job.backoffFor(reserved.attempts, options.backoff) : 0 as long;
+            if (job == null && p.backoff.size() > 0) {
+                let i = reserved.attempts - 1 < p.backoff.size() ? reserved.attempts - 1 : p.backoff.size() - 1;
+                delay = p.backoff[i < 0 ? 0 : i] as long;
+            }
+            driver.release(reserved, delay);
+            self.stats.released += 1;
+            self.manager.fire(new JobReleased(connection, reserved.queue, p.displayName, reserved.id, delay));
+        }
+        private fn failJob(connection: string, driver: QueueDriver, reserved: ReservedJob, p: Payload, job: Job, e: Exception) {
+            driver.delete(reserved);
+            self.manager.failedJobs.record(connection, reserved.queue, reserved.payload, Worker.describe(e));
+            self.stats.failed += 1;
+            if (job != null) {
+                try { job.failed(e); } catch (x: Exception) {}
+                if (job.uniqueId() != "") { self.manager.cache.forget(QueueManager.uniqueKey(job)); }
+            }
+            self.manager.fire(new JobFailed(connection, reserved.queue, p.displayName, reserved.id, e));
+            if (p.chainCatch != "") { self.manager.pushRaw(p.chainCatch); }
+            self.finishedOne(p, true);
+        }
+        static fn describe(e: Exception) -> string { return e.kind() + ": " + e.message(); }
+        private fn record(name: string, ms: long) {
+            self.stats.runtime.put(name, self.stats.runtime.getOr(name, 0) + ms);
+            self.stats.counts.put(name, self.stats.counts.getOr(name, 0) + 1);
+        }
+        private fn say(o: WorkerOptions, name: string, status: string, ms: long) {
+            if (o.output == null) { return; }
+            o.output(Moment.now().toDateTimeString() + " " + Text.padRight(name + " ", 50, ".") + " " + status + " ${ms}ms");
+        }
+
+        // ── chains and batches ─────────────────────────────────────────────────
+        private fn nextInChain(p: Payload) {
+            if (p.chain.size() == 0) { return; }
+            let next = Json.parse(p.chain[0]);
+            let rest = Json.array();
+            for (i in 1..p.chain.size()) { rest.push(Json.parse(p.chain[i])); }
+            next.set("chain", rest);
+            next.set("chainCatch", p.chainCatch == "" ? Json.nil() : Json.parse(p.chainCatch));
+            let text = next.toJson();
+            let n = JobCodec.read(text);
+            self.manager.pushRaw(text, n.queue, n.connection);
+        }
+        private fn finishedOne(p: Payload, failed: bool) { if (p.batchId != "") { self.finishBatch(p.batchId, failed, p.uuid); } }
+        // A batch job is done (or failed): the counts, and the batch's own jobs at the end.
+        fn finishBatch(id: string, failed: bool, jobId: string = "") {
+            let repo = self.manager.batches;
+            let b = repo.find(id);
+            if (b == null) { return; }
+            let counts = failed ? repo.jobFailed(id, jobId) : (jobId == "" ? [b.pendingJobs, b.failedJobs] as Array<long> : repo.jobFinished(id, jobId));
+            let pending = counts[0];
+            let failures = counts[1];
+            if (failed && failures == 1 && !b.allowFailures) {
+                repo.cancel(id);
+                if (b.catchJob != "") { self.manager.pushRaw(b.catchJob, b.queue, b.connection); }
+            }
+            if (pending <= 0 && !b.finished()) {
+                repo.markFinished(id);
+                if ((failures == 0 || b.allowFailures) && b.thenJob != "") { self.manager.pushRaw(b.thenJob, b.queue, b.connection); }
+                if (failures > 0 && b.allowFailures && b.catchJob != "") { self.manager.pushRaw(b.catchJob, b.queue, b.connection); }
+                if (b.finallyJob != "") { self.manager.pushRaw(b.finallyJob, b.queue, b.connection); }
+            }
+        }
+
+        // ── sync ───────────────────────────────────────────────────────────────
+        // Runs a job now, in this thread (one attempt); whether it succeeded. A
+        // failure is recorded and failed() called; lastError holds the exception.
+        fn runNow(job: Job, connection: string, queue: string, batchId: string = "") -> bool {
+            let state = new JobState();
+            state.id = "sync";
+            state.attempts = 1;
+            state.queue = queue;
+            state.connection = connection;
+            state.batchId = batchId;
+            state.batches = self.manager.batches;
+            job.state = state;
+            let name = job.displayName();
+            self.manager.fire(new JobProcessing(connection, queue, name, "sync", 1));
+            let started = Time.nowMs();
+            let error = self.runHandle(job, 0);
+            let ms = Time.nowMs() - started;
+            if (job.uniqueId() != "") { self.manager.cache.forget(QueueManager.uniqueKey(job)); }
+            let failure = error != null ? error : state.failure;
+            let fakePayload = new Payload();
+            fakePayload.batchId = batchId;
+            fakePayload.uuid = "sync";
+            if (failure != null) {
+                self.lastError = failure;
+                self.stats.failed += 1;
+                let payload = "";
+                try { payload = JobCodec.encode(job); } catch (e: Exception) { payload = "{\"job\":" + Json.quote(ClassInfo.of(job).name) + "}"; }
+                self.manager.failedJobs.record(connection, queue, payload, Worker.describe(failure));
+                try { job.failed(failure); } catch (x: Exception) {}
+                self.manager.fire(new JobFailed(connection, queue, name, "sync", failure));
+                self.finishedOne(fakePayload, true);
+                return false;
+            }
+            self.record(name, ms);
+            self.stats.processed += 1;
+            if (!state.deleted) { self.manager.fire(new JobProcessed(connection, queue, name, "sync", ms)); }
+            self.finishedOne(fakePayload, false);
+            return true;
+        }
+        // Runs an encoded job now (a retried failure on the sync connection).
+        fn runPayload(p: Payload, connection: string, queue: string) -> bool {
+            let job = JobCodec.rebuild(p);
+            return self.runNow(job, connection, queue, p.batchId);
+        }
+    }
+}

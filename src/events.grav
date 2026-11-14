@@ -1,0 +1,61 @@
+// events.grav — what the queue tells apogee-events (when the manager has
+// one): listen for JobFailed to page someone, JobProcessed for metrics, ….
+import "std"
+
+namespace apogee {
+
+    // The base of the queue's events (its decorator gives them reflection).
+    @QueueEvent abstract class QueueJobEvent {
+        public connection: string = ""
+        public queue: string = ""
+        // The job's display name (its class).
+        public job: string = ""
+        public jobId: string = ""
+    }
+    class JobQueued extends QueueJobEvent {
+        constructor(connection: string, queue: string, job: string, jobId: string) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; }
+    }
+    class JobProcessing extends QueueJobEvent {
+        public attempts: int = 0
+        constructor(connection: string, queue: string, job: string, jobId: string, attempts: int) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; self.attempts = attempts; }
+    }
+    class JobProcessed extends QueueJobEvent {
+        public ms: long = 0
+        constructor(connection: string, queue: string, job: string, jobId: string, ms: long) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; self.ms = ms; }
+    }
+    class JobReleased extends QueueJobEvent {
+        public delay: long = 0
+        constructor(connection: string, queue: string, job: string, jobId: string, delay: long) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; self.delay = delay; }
+    }
+    // An attempt threw (the job may still be retried).
+    class JobExceptionOccurred extends QueueJobEvent {
+        public exception: Exception = null
+        constructor(connection: string, queue: string, job: string, jobId: string, e: Exception) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; self.exception = e; }
+    }
+    // It failed for good.
+    class JobFailed extends QueueJobEvent {
+        public exception: Exception = null
+        constructor(connection: string, queue: string, job: string, jobId: string, e: Exception) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; self.exception = e; }
+    }
+    class JobTimedOut extends QueueJobEvent {
+        constructor(connection: string, queue: string, job: string, jobId: string) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; }
+    }
+    class WorkerStarting {
+        public name: string
+        public connection: string
+        public queues: string
+        constructor(name: string, connection: string, queues: string) { self.name = name; self.connection = connection; self.queues = queues; }
+    }
+    class WorkerStopping {
+        public name: string
+        public status: int
+        constructor(name: string, status: int) { self.name = name; self.status = status; }
+    }
+    // A queue grew past its threshold (queue.monitor()).
+    class QueueBusy {
+        public connection: string
+        public queue: string
+        public size: long
+        constructor(connection: string, queue: string, size: long) { self.connection = connection; self.queue = queue; self.size = size; }
+    }
+}

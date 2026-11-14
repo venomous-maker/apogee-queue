@@ -1,0 +1,370 @@
+// manager.grav — QueueManager: the connections (each a driver), and
+// dispatching jobs, chains and batches onto them.
+//
+//   let queue = new QueueManager(container)
+//   queue.addConnection("redis", RedisQueueDriver.open(url))
+//   queue.defaultConnection = "redis"
+//
+//   queue.dispatch(new SendWelcome(42))                        // the job's queue and delay
+//   queue.dispatch(new SendWelcome(42).onQueue("mail").delay(60))
+//   queue.dispatchSync(new RebuildIndex())                     // now, in this thread
+//   queue.dispatchAfterResponse(new LogVisit(path))            // once the response is sent
+//   queue.chain([new Fetch(url), new Parse(), new Store()]).catch(new ReportFailure()).dispatch()
+//   queue.batch(jobs).then(new Done()).dispatch()
+//
+// The "sync" connection runs jobs as they are dispatched (no worker): the
+// default until another is chosen, so jobs work before any queue is set up.
+import "std"
+import "apogee-container"
+import "apogee-events"
+import "apogee-support"
+import "grav-cache"
+import "job.grav"
+import "payload.grav"
+import "drivers.grav"
+import "failed.grav"
+import "batch.grav"
+import "worker.grav"
+
+namespace apogee {
+
+    // A job seen by queue.fake(): what was dispatched where.
+    class PushedJob {
+        public job: Job
+        public queue: string
+        public connection: string
+        public delay: long
+        // The classes of the jobs chained after it.
+        public chain: Array<string>
+        constructor(job: Job, queue: string, connection: string, delay: long, chain: Array<string>) { self.job = job; self.queue = queue; self.connection = connection; self.delay = delay; self.chain = chain; }
+    }
+
+    class QueueManager {
+        public container: Container
+        public events: Events = null
+        public defaultConnection: string = "sync"
+        public defaultQueue: string = "default"
+        public failedJobs: FailedJobStore
+        public batches: BatchRepository
+        // Locks for unique jobs (a shared store when workers run on several machines).
+        public cache: CacheRepository
+        private connections: HashMap<string, QueueDriver>
+        private afterResponse: Array<Job>
+        private lock: Mutex
+        // queue.fake(): jobs are recorded, not pushed.
+        private faking: bool = false
+        private pushed: Array<PushedJob>
+        private pushedBatches: Array<PendingBatch>
+        private sharedWorker: Worker = null
+
+        constructor(container: Container) {
+            self.container = container;
+            self.connections = new HashMap<string, QueueDriver>();
+            self.connections.put("sync", new SyncQueueDriver());
+            self.connections.put("null", new NullQueueDriver());
+            self.failedJobs = new MemoryFailedJobStore();
+            let store = new MemoryCacheStore();
+            self.batches = new CacheBatchRepository(store);
+            self.cache = new CacheRepository(store);
+            self.afterResponse = new Array<Job>();
+            self.lock = new Mutex();
+            self.pushed = new Array<PushedJob>();
+            self.pushedBatches = new Array<PendingBatch>();
+            container.instance::<QueueManager>(self);
+        }
+
+        // ── connections ────────────────────────────────────────────────────────
+        fn addConnection(name: string, driver: QueueDriver) -> QueueManager { self.connections.put(name, driver); return self; }
+        fn connection(name: string = "") -> QueueDriver {
+            let n = name == "" ? self.defaultConnection : name;
+            let d = self.connections.getOr(n, null);
+            if (d == null) { throw new StateError("no queue connection called '" + n + "'"); }
+            return d;
+        }
+        fn hasConnection(name: string) -> bool { return self.connections.containsKey(name); }
+        fn connectionNames() -> Array<string> { let k = self.connections.keys(); Sort.sort(k); return k; }
+        // Jobs waiting (due now) on a queue.
+        fn size(queue: string = "", connection: string = "") -> long { return self.connection(connection).size(queue == "" ? self.defaultQueue : queue); }
+        fn clear(queue: string = "", connection: string = "") -> long { return self.connection(connection).clear(queue == "" ? self.defaultQueue : queue); }
+        // The worker that runs sync and after-response jobs (and the default for work()).
+        fn worker() -> Worker {
+            if (self.sharedWorker == null) { self.sharedWorker = new Worker(self); }
+            return self.sharedWorker;
+        }
+
+        // ── dispatching ────────────────────────────────────────────────────────
+        // Pushes the job (or runs it now on the sync connection); its id, "" when
+        // a unique job with its key is already queued.
+        fn dispatch(job: Job) -> string { return self.pushChain(job, new Array<Job>(), null, ""); }
+        // Runs it now, in this thread, through its middleware (failures are recorded as usual).
+        fn dispatchSync(job: Job) {
+            let w = self.worker();
+            if (!w.runNow(job, "sync", job.queueName) && w.lastError != null) { throw w.lastError; }
+        }
+        fn dispatchIf(condition: bool, job: Job) -> string { return condition ? self.dispatch(job) : ""; }
+        fn dispatchUnless(condition: bool, job: Job) -> string { return condition ? "" : self.dispatch(job); }
+        // Pushes it with a delay of `seconds`.
+        fn later(seconds: long, job: Job) -> string { return self.dispatch(job.delay(seconds)); }
+        // Runs it in this process once the response has gone out (the HTTP kernel calls runAfterResponse()).
+        fn dispatchAfterResponse(job: Job) { self.lock.lock(); self.afterResponse.push(job); self.lock.unlock(); }
+        fn runAfterResponse() {
+            self.lock.lock();
+            let jobs = self.afterResponse;
+            self.afterResponse = new Array<Job>();
+            self.lock.unlock();
+            for (j in jobs) { self.dispatchSync(j); }
+        }
+        // Many jobs onto one queue at once (one round trip on Redis); their ids.
+        fn bulk(jobs: Array<Job>, queue: string = "", connection: string = "") -> Array<string> {
+            if (jobs.size() == 0) { return new Array<string>(); }
+            let conn = connection == "" ? (jobs[0].connectionName == "" ? self.defaultConnection : jobs[0].connectionName) : connection;
+            let q = queue == "" ? (jobs[0].queueName == "" ? self.defaultQueue : jobs[0].queueName) : queue;
+            if (self.faking || self.connection(conn).name() == "sync") {
+                let ids = new Array<string>();
+                for (j in jobs) { ids.push(self.dispatch(j.onQueue(q).onConnection(conn))); }
+                return ids;
+            }
+            let payloads = new Array<string>();
+            for (j in jobs) { j.queueName = q; j.connectionName = conn; payloads.push(JobCodec.encode(j)); }
+            let ids = self.connection(conn).pushMany(q, payloads, jobs[0].delaySeconds);
+            for (j in jobs) { self.fire(new JobQueued(conn, q, j.displayName(), "")); }
+            return ids;
+        }
+        // A chain: each job runs after the one before it succeeds.
+        fn chain(jobs: Array<Job>) -> PendingChain { return new PendingChain(self, jobs); }
+        // A batch: jobs run in any order, tracked together.
+        fn batch(jobs: Array<Job>) -> PendingBatch { return new PendingBatch(self, jobs); }
+        fn findBatch(id: string) -> Batch { return self.batches.find(id); }
+
+        // (the shared path: unique locks, the fake, sync, then the driver)
+        fn pushChain(job: Job, rest: Array<Job>, catchJob: Job, batchId: string) -> string {
+            let conn = job.connectionName == "" ? self.defaultConnection : job.connectionName;
+            let q = job.queueName == "" ? self.defaultQueue : job.queueName;
+            if (self.faking) {
+                let names = new Array<string>();
+                for (r in rest) { names.push(ClassInfo.of(r).name); }
+                self.lock.lock();
+                self.pushed.push(new PushedJob(job, q, conn, job.delaySeconds, names));
+                self.lock.unlock();
+                return "fake-${self.pushed.size()}";
+            }
+            if (job.uniqueId() != "") {
+                if (!self.cache.add(QueueManager.uniqueKey(job), "1", job.uniqueFor())) { return ""; }
+            }
+            let driver = self.connection(conn);
+            if (driver.name() == "sync") {
+                let w = self.worker();
+                let ok = w.runNow(job, "sync", q, batchId);
+                if (ok && rest.size() > 0) {
+                    let next = rest[0];
+                    let after = rest.slice(1, rest.size());
+                    if (next.queueName == "") { next.queueName = job.queueName; }
+                    return self.pushChain(next, after, catchJob, batchId);
+                }
+                if (!ok) {
+                    // (as Laravel's sync driver: the job's exception reaches the caller, unless a catch or a batch handles it)
+                    if (catchJob != null) { self.dispatchSync(catchJob); }
+                    else if (batchId == "" && w.lastError != null) { throw w.lastError; }
+                }
+                return "sync";
+            }
+            let chainPayloads = new Array<string>();
+            for (r in rest) {
+                if (r.queueName == "") { r.queueName = job.queueName; }
+                if (r.connectionName == "") { r.connectionName = job.connectionName; }
+                chainPayloads.push(JobCodec.encode(r));
+            }
+            let catchPayload = catchJob == null ? "" : JobCodec.encode(catchJob);
+            let payload = JobCodec.encode(job, chainPayloads, catchPayload, batchId);
+            let id = driver.push(q, payload, job.delaySeconds);
+            self.fire(new JobQueued(conn, q, job.displayName(), id));
+            return id;
+        }
+        // Pushes an already-encoded payload (retrying a failed job, a chain's next link).
+        fn pushRaw(payload: string, queue: string = "", connection: string = "", delaySeconds: long = 0) -> string {
+            let p = JobCodec.read(payload);
+            let conn = connection != "" ? connection : (p.connection != "" ? p.connection : self.defaultConnection);
+            let q = queue != "" ? queue : (p.queue != "" ? p.queue : self.defaultQueue);
+            let driver = self.connection(conn);
+            if (driver.name() == "sync") { self.worker().runPayload(p, "sync", q); return "sync"; }
+            return driver.push(q, payload, delaySeconds);
+        }
+        static fn uniqueKey(job: Job) -> string { return "unique-job:" + ClassInfo.of(job).name + ":" + job.uniqueId(); }
+
+        // ── failed jobs ────────────────────────────────────────────────────────
+        // Puts a failed job back on its queue (and forgets the failure); whether it was there.
+        fn retry(failedId: string) -> bool {
+            let f = self.failedJobs.find(failedId);
+            if (f == null) { return false; }
+            self.pushRaw(f.payload, f.queue, f.connection);
+            self.failedJobs.forget(failedId);
+            return true;
+        }
+        // Every failed job retried; how many.
+        fn retryAll() -> int {
+            let n = 0;
+            for (f in self.failedJobs.all()) { if (self.retry(f.id)) { n += 1; } }
+            return n;
+        }
+
+        // ── queued listeners ───────────────────────────────────────────────────
+        // Listener classes whose shouldQueue() is true now run on the queue (as a
+        // CallQueuedListener job), not during dispatch. The event travels with the
+        // job, so its class needs reflection (a decorator such as @Event).
+        fn queueListenersOf(events: Events) -> QueueManager {
+            self.events = events;
+            let me = self;
+            events.queueUsing(fn(listenerClass: string, queue: string, event: any) {
+                let job = new CallQueuedListener();
+                job.listenerClass = listenerClass;
+                job.event = event;
+                if (queue != "") { job.queueName = queue; }
+                me.dispatch(job);
+            });
+            return self;
+        }
+        fn fire(e: any) { if (self.events != null && !self.faking) { self.events.dispatch(e); } }
+
+        // ── testing ────────────────────────────────────────────────────────────
+        // Records dispatched jobs instead of pushing or running them.
+        fn fake() { self.faking = true; self.pushed = new Array<PushedJob>(); self.pushedBatches = new Array<PendingBatch>(); }
+        fn stopFaking() { self.faking = false; }
+        fn isFaking() -> bool { return self.faking; }
+        fn recordBatch(b: PendingBatch) { self.lock.lock(); self.pushedBatches.push(b); self.lock.unlock(); }
+        fn pushedJobs() -> Array<PushedJob> { return self.pushed.copy(); }
+        // The dispatched jobs of class J.
+        fn pushedOf<J>() -> Array<J> {
+            let out = new Array<J>();
+            let name = nameof(J);
+            for (p in self.pushed) { if (ClassInfo.of(p.job).name == name) { out.push(p.job as J); } }
+            return out;
+        }
+        fn assertPushed<J>(times: int = -1) {
+            let n = self.pushedOf::<J>().size();
+            if (times < 0 && n == 0) { throw new AssertionError("expected a " + nameof(J) + " to be pushed; none was"); }
+            if (times >= 0 && n != times) { throw new AssertionError("expected " + nameof(J) + " pushed ${times} time(s), got ${n}"); }
+        }
+        // That a J was pushed and `check` accepts it.
+        fn assertPushedWhere<J>(check: fn(J) -> bool) {
+            for (j in self.pushedOf::<J>()) { if (check(j)) { return; } }
+            throw new AssertionError("no pushed " + nameof(J) + " matches");
+        }
+        fn assertPushedOn<J>(queue: string) {
+            let name = nameof(J);
+            for (p in self.pushed) { if (ClassInfo.of(p.job).name == name && p.queue == queue) { return; } }
+            throw new AssertionError("expected a " + name + " on the '" + queue + "' queue");
+        }
+        // That a J was pushed with these job classes chained after it, in order.
+        fn assertPushedWithChain<J>(chain: Array<string>) {
+            let name = nameof(J);
+            for (p in self.pushed) {
+                if (ClassInfo.of(p.job).name != name || p.chain.size() != chain.size()) { continue; }
+                let same = true;
+                for (i in 0..chain.size()) { if (p.chain[i] != chain[i] && !Str.endsWith(p.chain[i], "." + chain[i])) { same = false; } }
+                if (same) { return; }
+            }
+            throw new AssertionError("no " + name + " was pushed with the chain " + str(chain));
+        }
+        fn assertNotPushed<J>() {
+            let n = self.pushedOf::<J>().size();
+            if (n > 0) { throw new AssertionError("expected no " + nameof(J) + " to be pushed; ${n} were"); }
+        }
+        fn assertNothingPushed() {
+            if (self.pushed.size() > 0) { throw new AssertionError("expected nothing pushed; ${self.pushed.size()} job(s) were"); }
+        }
+        fn assertBatched(check: fn(PendingBatch) -> bool) {
+            for (b in self.pushedBatches) { if (check(b)) { return; } }
+            throw new AssertionError("no batch matches");
+        }
+        fn assertBatchCount(n: int) {
+            if (self.pushedBatches.size() != n) { throw new AssertionError("expected ${n} batch(es), got ${self.pushedBatches.size()}"); }
+        }
+    }
+
+    class AssertionError extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "AssertionError"; }
+    }
+
+    // queue.chain(jobs)…dispatch().
+    class PendingChain {
+        private manager: QueueManager
+        private jobs: Array<Job>
+        private catchJob: Job = null
+        constructor(manager: QueueManager, jobs: Array<Job>) { self.manager = manager; self.jobs = jobs; }
+        fn onQueue(queue: string) -> PendingChain { for (j in self.jobs) { if (j.queueName == "") { j.queueName = queue; } } return self; }
+        fn onConnection(connection: string) -> PendingChain { for (j in self.jobs) { if (j.connectionName == "") { j.connectionName = connection; } } return self; }
+        fn delay(seconds: long) -> PendingChain { if (self.jobs.size() > 0) { self.jobs[0].delaySeconds = seconds; } return self; }
+        // A job to run if any link fails.
+        fn catch(job: Job) -> PendingChain { self.catchJob = job; return self; }
+        fn prepend(job: Job) -> PendingChain { self.jobs.insert(0, job); return self; }
+        fn append(job: Job) -> PendingChain { self.jobs.push(job); return self; }
+        fn dispatch() -> string {
+            if (self.jobs.size() == 0) { return ""; }
+            return self.manager.pushChain(self.jobs[0], self.jobs.slice(1, self.jobs.size()), self.catchJob, "");
+        }
+    }
+
+    // queue.batch(jobs)…dispatch().
+    class PendingBatch {
+        public jobs: Array<Job>
+        public batchName: string = ""
+        public allowFailuresFlag: bool = false
+        public thenJob: Job = null
+        public catchJob: Job = null
+        public finallyJob: Job = null
+        public queue: string = ""
+        public connection: string = ""
+        private manager: QueueManager
+        constructor(manager: QueueManager, jobs: Array<Job>) { self.manager = manager; self.jobs = jobs; }
+        fn name(n: string) -> PendingBatch { self.batchName = n; return self; }
+        fn then(job: Job) -> PendingBatch { self.thenJob = job; return self; }
+        fn catch(job: Job) -> PendingBatch { self.catchJob = job; return self; }
+        fn finally(job: Job) -> PendingBatch { self.finallyJob = job; return self; }
+        // Keep going (and still run then()) when some jobs fail.
+        fn allowFailures() -> PendingBatch { self.allowFailuresFlag = true; return self; }
+        fn onQueue(q: string) -> PendingBatch { self.queue = q; return self; }
+        fn onConnection(c: string) -> PendingBatch { self.connection = c; return self; }
+        fn dispatch() -> Batch {
+            let b = new Batch(Text.orderedUuid());
+            b.name = self.batchName;
+            b.totalJobs = self.jobs.size() as long;
+            b.pendingJobs = b.totalJobs;
+            b.allowFailures = self.allowFailuresFlag;
+            b.thenJob = self.thenJob == null ? "" : JobCodec.encode(self.thenJob);
+            b.catchJob = self.catchJob == null ? "" : JobCodec.encode(self.catchJob);
+            b.finallyJob = self.finallyJob == null ? "" : JobCodec.encode(self.finallyJob);
+            b.queue = self.queue;
+            b.connection = self.connection;
+            b.createdAt = Time.now();
+            b.repository = self.manager.batches;
+            if (self.manager.isFaking()) { self.manager.recordBatch(self); return b; }
+            self.manager.batches.store(b);
+            for (j in self.jobs) {
+                if (self.queue != "" && j.queueName == "") { j.queueName = self.queue; }
+                if (self.connection != "" && j.connectionName == "") { j.connectionName = self.connection; }
+                self.manager.pushChain(j, new Array<Job>(), null, b.id);
+            }
+            if (b.totalJobs == 0) { self.manager.worker().finishBatch(b.id, false); }
+            return self.manager.batches.find(b.id);
+        }
+    }
+
+    // A queued listener: makes the listener (through the container) and calls
+    // its handle(event) on the worker.
+    class CallQueuedListener extends Job {
+        public listenerClass: string = ""
+        public event: any = null
+        constructor() {}
+        fn displayName() -> string { return self.listenerClass; }
+        fn handle(container: Container) {
+            let cls = ClassInfo.forName(self.listenerClass);
+            if (cls == null) { throw new StateError("no listener class '" + self.listenerClass + "'"); }
+            let listener = container.build(cls);
+            // (handle takes the event itself: not something for the container to make)
+            let h = cls.method("handle");
+            if (h == null) { throw new StateError(self.listenerClass + " has no handle method"); }
+            h.invoke(listener, [self.event]);
+        }
+    }
+}
