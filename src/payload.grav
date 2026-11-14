@@ -58,6 +58,10 @@ namespace apogee {
         // when it no longer exists. The framework sets it (Orbit's find); with
         // none, models travel as whole objects instead.
         static entityResolver: fn(string, string) -> any = null
+        // The id of a value that is a model ("" for one that is not): models of
+        // an ORM travel by id without implementing QueueableEntity (the
+        // framework sets it for Orbit models).
+        static entityKey: fn(any) -> string = null
 
         // ── encoding ────────────────────────────────────────────────────────────
         static fn encode(job: Job, chain: Array<string> = new Array<string>(), chainCatch: string = "", batchId: string = "") -> string {
@@ -133,6 +137,12 @@ namespace apogee {
             if (v is HashMap<string, bool>) { let m = new HashMap<string, any>(); (v as HashMap<string, bool>).forEach(fn(k: string, x: bool) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
             if (v is JsonValue) { sb.append("{\"$json\":").append((v as JsonValue).toJson()).append("}"); return; }
             let info = ClassInfo.of(v);
+            let keyOf = JobCodec.entityKey;
+            let key = keyOf != null && JobCodec.entityResolver != null ? keyOf(v) : "";
+            if (key != "") {
+                sb.append("{\"$entity\":").append(Json.quote(info.name)).append(",\"id\":").append(Json.quote(key)).append("}");
+                return;
+            }
             if (v is QueueableEntity && JobCodec.entityResolver != null) {
                 sb.append("{\"$entity\":").append(Json.quote(info.name)).append(",\"id\":").append(Json.quote((v as QueueableEntity).queueableId())).append("}");
                 return;
