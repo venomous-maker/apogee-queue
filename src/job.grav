@@ -149,7 +149,7 @@ namespace apogee {
         public decaySeconds: long
         // Delete the job instead of releasing it when over the limit.
         public dropWhenLimited: bool = false
-        private limiter: RateLimiter
+        private limiter: cache.RateLimiter
         constructor(key: string, maxAttempts: long, decaySeconds: long = 60, cache: CacheRepository = null) {
             self.key = key; self.maxAttempts = maxAttempts; self.decaySeconds = decaySeconds;
             self.limiter = (cache == null ? Cache.repository() : cache).limiter();
@@ -197,7 +197,7 @@ namespace apogee {
         public key: string
         public maxAttempts: long
         public decaySeconds: long
-        private limiter: RateLimiter
+        private limiter: cache.RateLimiter
         constructor(key: string, maxAttempts: long = 10, decaySeconds: long = 600, cache: CacheRepository = null) {
             self.key = key; self.maxAttempts = maxAttempts; self.decaySeconds = decaySeconds;
             self.limiter = (cache == null ? Cache.repository() : cache).limiter();
