@@ -1,0 +1,297 @@
+// payload.grav — how a job travels: its class, settings and fields as JSON,
+// and back into a job on the worker.
+//
+// A field can hold what JSON can (numbers, text, bools, null), an enum, a
+// Moment or DateTime or Decimal, an Array or HashMap of those (any element
+// type the field names: Array<string>, HashMap<string, any>, …), another
+// reflected object (its fields, the same way), or a model: a QueueableEntity
+// travels as its class and id, and is fetched again on the worker (fresh,
+// as Laravel's SerializesModels does) through JobCodec.entityResolver.
+// Fields marked @Transient, and functions, stay behind.
+import "std"
+import "apogee-support"
+import "job.grav"
+
+namespace apogee {
+
+    // A model a job can carry by id (Orbit models, or your own).
+    interface QueueableEntity {
+        fn queueableId() -> string
+    }
+
+    // A model a job carried is gone (and the job does not deleteWhenMissingModels).
+    class ModelNotFoundException extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "ModelNotFoundException"; }
+    }
+
+    // What a pushed job is: its JSON, and the parts the queue reads without
+    // rebuilding it.
+    class Payload {
+        public uuid: string = ""
+        public jobClass: string = ""
+        public displayName: string = ""
+        public maxTries: int = 0
+        public timeout: int = 0
+        public backoff: Array<int>
+        public maxExceptions: int = 0
+        public retryUntil: long = 0
+        public failOnTimeout: bool = false
+        public queue: string = ""
+        public connection: string = ""
+        public batchId: string = ""
+        public pushedAt: long = 0
+        public tags: Array<string>
+        // The job's fields, as JSON.
+        public data: JsonValue = null
+        // The jobs to run after it, in order (their payloads' JSON), and the
+        // one to run if any of them fails.
+        public chain: Array<string>
+        public chainCatch: string = ""
+        // The whole payload's JSON, as pushed.
+        public raw: string = ""
+        constructor() { self.backoff = new Array<int>(); self.tags = new Array<string>(); self.chain = new Array<string>(); }
+    }
+
+    class JobCodec {
+        // Fetches a model a job carried: (class name, id) -> the model, or null
+        // when it no longer exists. The framework sets it (Orbit's find); with
+        // none, models travel as whole objects instead.
+        static entityResolver: fn(string, string) -> any = null
+
+        // ── encoding ────────────────────────────────────────────────────────────
+        static fn encode(job: Job, chain: Array<string> = new Array<string>(), chainCatch: string = "", batchId: string = "") -> string {
+            let sb = new StringBuilder();
+            let info = ClassInfo.of(job);
+            sb.append("{\"uuid\":").append(Json.quote(Text.uuid()));
+            sb.append(",\"job\":").append(Json.quote(info.name));
+            sb.append(",\"displayName\":").append(Json.quote(job.displayName()));
+            sb.append(",\"maxTries\":").appendInt(job.tries as long);
+            sb.append(",\"timeout\":").appendInt(job.timeout as long);
+            sb.append(",\"backoff\":[");
+            for (i, b in job.backoff) { if (i > 0) { sb.append(","); } sb.appendInt(b as long); }
+            sb.append("],\"maxExceptions\":").appendInt(job.maxExceptions as long);
+            sb.append(",\"retryUntil\":").appendInt(job.retryUntilUnix);
+            sb.append(",\"failOnTimeout\":").append(job.failOnTimeout ? "true" : "false");
+            sb.append(",\"queue\":").append(Json.quote(job.queueName));
+            sb.append(",\"connection\":").append(Json.quote(job.connectionName));
+            sb.append(",\"batchId\":").append(Json.quote(batchId));
+            sb.append(",\"pushedAt\":").appendInt(Time.nowMs());
+            sb.append(",\"tags\":[");
+            for (i, t in job.tags()) { if (i > 0) { sb.append(","); } sb.append(Json.quote(t)); }
+            sb.append("],\"data\":");
+            JobCodec.writeFields(sb, job, info, 0);
+            sb.append(",\"chain\":[");
+            for (i, c in chain) { if (i > 0) { sb.append(","); } sb.append(c); }
+            sb.append("],\"chainCatch\":").append(chainCatch == "" ? "null" : chainCatch);
+            sb.append("}");
+            return sb.toString();
+        }
+        private static fn writeFields(sb: StringBuilder, obj: any, info: ClassInfo, depth: int) {
+            sb.append("{");
+            let first = true;
+            for (f in info.fields()) {
+                if (f.has("Transient") || !f.canGet() || !f.canSet() || Str.startsWith(f.typeName, "fn(")) { continue; }
+                if (!first) { sb.append(","); }
+                first = false;
+                sb.append(Json.quote(f.name)).append(":");
+                try { JobCodec.writeValue(sb, f.get(obj), depth + 1); }
+                catch (e: ValueError) { throw new ValueError("cannot queue the field '" + f.name + "' of " + info.name + ": " + e.message()); }
+            }
+            sb.append("}");
+        }
+        static fn writeValue(sb: StringBuilder, v: any, depth: int) {
+            if (depth > 32) { throw new ValueError("nested more than 32 levels deep (a cycle?)"); }
+            if (v == null) { sb.append("null"); return; }
+            if (v is string) { sb.append(Json.quote(v as string)); return; }
+            if (v is long) { sb.appendInt(v as long); return; }
+            if (v is int) { sb.appendInt((v as int) as long); return; }
+            if (v is bool) { sb.append((v as bool) ? "true" : "false"); return; }
+            if (v is double) { sb.appendFloat(v as double); return; }
+            if (v is float) { sb.appendFloat((v as float) as double); return; }
+            if (v is Moment) {
+                let m = v as Moment;
+                sb.append("{\"$moment\":[").appendInt(m.unixMicros()).append(",").append(Json.quote(m.tzName())).append("]}");
+                return;
+            }
+            if (v is DateTime) { sb.append("{\"$datetime\":").appendInt((v as DateTime).unixMicros()).append("}"); return; }
+            if (v is Decimal) { sb.append("{\"$decimal\":").append(Json.quote((v as Decimal).toString())).append("}"); return; }
+            if (v is Array<any>) { JobCodec.writeList(sb, v as Array<any>, depth); return; }
+            if (v is Array<string>) { sb.append("["); for (i, x in v as Array<string>) { if (i > 0) { sb.append(","); } sb.append(Json.quote(x)); } sb.append("]"); return; }
+            if (v is Array<long>) { sb.append("["); for (i, x in v as Array<long>) { if (i > 0) { sb.append(","); } sb.appendInt(x); } sb.append("]"); return; }
+            if (v is Array<int>) { sb.append("["); for (i, x in v as Array<int>) { if (i > 0) { sb.append(","); } sb.appendInt(x as long); } sb.append("]"); return; }
+            if (v is Array<double>) { sb.append("["); for (i, x in v as Array<double>) { if (i > 0) { sb.append(","); } sb.appendFloat(x); } sb.append("]"); return; }
+            if (v is Array<bool>) { sb.append("["); for (i, x in v as Array<bool>) { if (i > 0) { sb.append(","); } sb.append(x ? "true" : "false"); } sb.append("]"); return; }
+            if (v is Array<Moment>) { let l = new Array<any>(); for (x in v as Array<Moment>) { l.push(x); } JobCodec.writeList(sb, l, depth); return; }
+            if (v is HashMap<string, any>) { JobCodec.writeMap(sb, v as HashMap<string, any>, depth); return; }
+            if (v is HashMap<string, string>) { let m = new HashMap<string, any>(); (v as HashMap<string, string>).forEach(fn(k: string, x: string) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            if (v is HashMap<string, long>) { let m = new HashMap<string, any>(); (v as HashMap<string, long>).forEach(fn(k: string, x: long) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            if (v is HashMap<string, int>) { let m = new HashMap<string, any>(); (v as HashMap<string, int>).forEach(fn(k: string, x: int) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            if (v is HashMap<string, double>) { let m = new HashMap<string, any>(); (v as HashMap<string, double>).forEach(fn(k: string, x: double) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            if (v is HashMap<string, bool>) { let m = new HashMap<string, any>(); (v as HashMap<string, bool>).forEach(fn(k: string, x: bool) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            if (v is JsonValue) { sb.append("{\"$json\":").append((v as JsonValue).toJson()).append("}"); return; }
+            let info = ClassInfo.of(v);
+            if (v is QueueableEntity && JobCodec.entityResolver != null) {
+                sb.append("{\"$entity\":").append(Json.quote(info.name)).append(",\"id\":").append(Json.quote((v as QueueableEntity).queueableId())).append("}");
+                return;
+            }
+            if (info != null && info.isReflected()) {
+                if (!info.canCreate()) { throw new ValueError(info.name + " has no constructor without arguments, so it cannot be rebuilt on the worker"); }
+                sb.append("{\"$object\":").append(Json.quote(info.name)).append(",\"fields\":");
+                JobCodec.writeFields(sb, v, info, depth);
+                sb.append("}");
+                return;
+            }
+            // (no class: an enum, kept by name; a class without reflection has no JSON form)
+            if (info == null) { sb.append("{\"$enum\":").append(Json.quote(str(v))).append("}"); return; }
+            throw new ValueError("a " + typename(v) + " cannot be queued (give its class a decorator for reflection, or keep its id instead)");
+        }
+        private static fn writeList(sb: StringBuilder, list: Array<any>, depth: int) {
+            sb.append("[");
+            for (i, x in list) { if (i > 0) { sb.append(","); } JobCodec.writeValue(sb, x, depth + 1); }
+            sb.append("]");
+        }
+        private static fn writeMap(sb: StringBuilder, m: HashMap<string, any>, depth: int) {
+            sb.append("{");
+            let first = true;
+            let keys = m.keys();
+            for (k in keys) {
+                if (!first) { sb.append(","); }
+                first = false;
+                // (a key starting with "$" gets a second one: "$" alone marks our tags)
+                sb.append(Json.quote(Str.startsWith(k, "$") ? "$" + k : k)).append(":");
+                JobCodec.writeValue(sb, m[k], depth + 1);
+            }
+            sb.append("}");
+        }
+
+        // ── decoding ────────────────────────────────────────────────────────────
+        static fn read(raw: string) -> Payload {
+            let j = Json.parse(raw);
+            let p = new Payload();
+            p.raw = raw;
+            p.uuid = j.getString("uuid", "");
+            p.jobClass = j.getString("job", "");
+            p.displayName = j.getString("displayName", p.jobClass);
+            p.maxTries = j.getInt("maxTries", 0);
+            p.timeout = j.getInt("timeout", 0);
+            if (j.has("backoff")) { for (b in j.get("backoff").asArray()) { p.backoff.push(b.asInt()); } }
+            p.maxExceptions = j.getInt("maxExceptions", 0);
+            p.retryUntil = j.getLong("retryUntil", 0);
+            p.failOnTimeout = j.getBool("failOnTimeout", false);
+            p.queue = j.getString("queue", "");
+            p.connection = j.getString("connection", "");
+            p.batchId = j.getString("batchId", "");
+            p.pushedAt = j.getLong("pushedAt", 0);
+            if (j.has("tags")) { for (t in j.get("tags").asArray()) { p.tags.push(t.asString()); } }
+            p.data = j.has("data") ? j.get("data") : Json.object();
+            if (j.has("chain")) { for (c in j.get("chain").asArray()) { p.chain.push(c.toJson()); } }
+            if (j.has("chainCatch") && !j.get("chainCatch").isNull()) { p.chainCatch = j.get("chainCatch").toJson(); }
+            return p;
+        }
+        // The job a payload describes, rebuilt.
+        static fn rebuild(p: Payload) -> Job {
+            let cls = ClassInfo.forName(p.jobClass);
+            if (cls == null) { throw new StateError("no job class '" + p.jobClass + "' in this program"); }
+            if (!cls.canCreate()) { throw new StateError(p.jobClass + " needs a constructor that takes no arguments"); }
+            let job = cls.create() as Job;
+            JobCodec.fillFields(job, cls, p.data);
+            return job;
+        }
+        private static fn fillFields(obj: any, info: ClassInfo, data: JsonValue) {
+            for (f in info.fields()) {
+                if (f.has("Transient") || !f.canSet() || !data.has(f.name)) { continue; }
+                let v = data.get(f.name);
+                if (f.isEnum()) { JobCodec.setEnum(f, obj, v); continue; }
+                f.set(obj, JobCodec.typed(f.typeName, v));
+            }
+        }
+        // (an enum field takes an ordinal: the one whose name matches)
+        private static fn setEnum(f: FieldInfo, obj: any, v: JsonValue) {
+            if (v.isNull()) { return; }
+            let name = v.isObject() && v.has("$enum") ? v.get("$enum").asString() : (v.isString() ? v.asString() : "");
+            if (v.isNumber()) { f.set(obj, v.asInt()); return; }
+            for (i in 0..256) {
+                try { f.set(obj, i); } catch (e: ValueError) { break; }
+                if (str(f.get(obj)) == name) { return; }
+            }
+            throw new ValueError("no " + f.typeName + " called '" + name + "'");
+        }
+        // A JSON value as the field type `type` wants it.
+        static fn typed(typeName: string, v: JsonValue) -> any {
+            if (v == null || v.isNull()) { return null; }
+            let t = Str.endsWith(typeName, "?") ? typeName[..typeName.length - 1] : typeName;
+            if (t == "string") { return v.isString() ? v.asString() : v.toJson(); }
+            if (t == "int" || t == "long" || t == "short" || t == "byte") { return v.isNumber() ? v.asLong() as any : (v.isBool() ? (v.asBool() ? 1 : 0) as any : Integer.parseOr(v.isString() ? v.asString() : "0", 0) as any); }
+            if (t == "float" || t == "double") { return v.isNumber() ? v.asFloat() as any : 0.0 as any; }
+            if (t == "bool") { return v.isBool() ? v.asBool() : (v.isNumber() && v.asLong() != 0); }
+            if (Str.startsWith(t, "Array<")) {
+                let el = Str.trim(t[6..t.length - 1]);
+                let items = v.isArray() ? v.asArray() : new Array<JsonValue>();
+                if (el == "string") { let a = new Array<string>(); for (x in items) { a.push(x.isString() ? x.asString() : x.toJson()); } return a; }
+                if (el == "long") { let a = new Array<long>(); for (x in items) { a.push(x.asLong()); } return a; }
+                if (el == "int") { let a = new Array<int>(); for (x in items) { a.push(x.asInt()); } return a; }
+                if (el == "double" || el == "float") { let a = new Array<double>(); for (x in items) { a.push(x.asFloat()); } return a; }
+                if (el == "bool") { let a = new Array<bool>(); for (x in items) { a.push(x.asBool()); } return a; }
+                if (el == "apogee.Moment" || el == "Moment") { let a = new Array<Moment>(); for (x in items) { a.push(JobCodec.plain(x) as Moment); } return a; }
+                let a = new Array<any>();
+                for (x in items) { a.push(JobCodec.plain(x)); }
+                return a;
+            }
+            if (Str.startsWith(t, "HashMap<string,")) {
+                let el = Str.trim(t[15..t.length - 1]);
+                let keys = v.isObject() ? v.keys() : new Array<string>();
+                if (el == "string") { let m = new HashMap<string, string>(); for (k in keys) { let x = v.get(k); m.put(JobCodec.key(k), x.isString() ? x.asString() : x.toJson()); } return m; }
+                if (el == "long") { let m = new HashMap<string, long>(); for (k in keys) { m.put(JobCodec.key(k), v.get(k).asLong()); } return m; }
+                if (el == "int") { let m = new HashMap<string, int>(); for (k in keys) { m.put(JobCodec.key(k), v.get(k).asInt()); } return m; }
+                if (el == "double" || el == "float") { let m = new HashMap<string, double>(); for (k in keys) { m.put(JobCodec.key(k), v.get(k).asFloat()); } return m; }
+                if (el == "bool") { let m = new HashMap<string, bool>(); for (k in keys) { m.put(JobCodec.key(k), v.get(k).asBool()); } return m; }
+                let m = new HashMap<string, any>();
+                for (k in keys) { m.put(JobCodec.key(k), JobCodec.plain(v.get(k))); }
+                return m;
+            }
+            return JobCodec.plain(v);
+        }
+        private static fn key(k: string) -> string { return Str.startsWith(k, "$$") ? k[1..] : k; }
+        // A JSON value as a plain value, our tags turned back into what they were.
+        static fn plain(v: JsonValue) -> any {
+            if (v == null || v.isNull()) { return null; }
+            if (v.isBool()) { return v.asBool(); }
+            if (v.isInteger()) { return v.asLong(); }
+            if (v.isNumber()) { return v.asFloat(); }
+            if (v.isString()) { return v.asString(); }
+            if (v.isArray()) {
+                let out = new Array<any>();
+                for (x in v.asArray()) { out.push(JobCodec.plain(x)); }
+                return out;
+            }
+            if (v.has("$moment")) {
+                let parts = v.get("$moment");
+                return Moment.fromUnixMicros(parts.at(0).asLong(), parts.at(1).asString());
+            }
+            if (v.has("$datetime")) { let us = v.get("$datetime").asLong(); return DateTime.fromUnix(Civil.floorDiv(us, 1000000), Civil.floorMod(us, 1000000) as int); }
+            if (v.has("$decimal")) { return Decimal.parse(v.get("$decimal").asString()); }
+            if (v.has("$json")) { return v.get("$json"); }
+            if (v.has("$enum")) { return v.get("$enum").asString(); }
+            if (v.has("$entity")) {
+                let cls = v.get("$entity").asString();
+                let id = v.getString("id", "");
+                let resolve = JobCodec.entityResolver;
+                let found = resolve == null ? null : resolve(cls, id);
+                if (found == null) { throw new ModelNotFoundException("no " + cls + " with id " + id + " (it was queued with the job)"); }
+                return found;
+            }
+            if (v.has("$object")) {
+                let name = v.get("$object").asString();
+                let cls = ClassInfo.forName(name);
+                if (cls == null || !cls.canCreate()) { throw new StateError("cannot rebuild a " + name + " in this program"); }
+                let obj = cls.create();
+                JobCodec.fillFields(obj, cls, v.get("fields"));
+                return obj;
+            }
+            let out = new HashMap<string, any>();
+            for (k in v.keys()) { out.put(JobCodec.key(k), JobCodec.plain(v.get(k))); }
+            return out;
+        }
+    }
+}

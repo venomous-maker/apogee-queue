@@ -1,0 +1,234 @@
+// job.grav — Job: work to do later, on a worker. Extend it, give it the
+// fields it needs (they travel with it as JSON) and a handle() method (its
+// parameters come from the container), and dispatch it:
+//
+//   class SendWelcome extends Job {
+//       public userId: long = 0
+//       constructor(userId: long = 0) { self.userId = userId; self.tries = 3; self.backoff = [10, 60] }
+//       fn handle(mailer: Mailer, users: UserRepository) { mailer.send(users.find(self.userId), "welcome") }
+//       fn failed(e: Exception) { … }
+//   }
+//   queue.dispatch(new SendWelcome(42).onQueue("mail").delay(30))
+//
+// A job needs a constructor that takes no arguments (give its parameters
+// defaults): the worker makes an empty one and fills its fields.
+import "std"
+import "batch.grav"
+import "apogee-support"
+import "grav-cache"
+
+namespace apogee {
+
+    // A field that does not travel with the job (a connection, a cache).
+    // (@Transient on a field; nothing to declare: the decorator is read by name.)
+
+    // The base class of every job. Its decorator gives every job reflection:
+    // the worker finds the class by name, makes one, fills its fields, and
+    // calls handle() through the container.
+    @Queueable abstract class Job {
+        // Attempts before the job fails (0: the worker's --tries).
+        public tries: int = 0
+        // Seconds one attempt may take (0: the worker's --timeout).
+        public timeout: int = 0
+        // Seconds to wait before each retry: [10, 60, 300] (the last repeats); empty: the worker's --backoff.
+        public backoff: Array<int> = new Array<int>()
+        // Unhandled exceptions allowed before it fails, however many tries are left (0: no limit).
+        public maxExceptions: int = 0
+        // Unix seconds after which it is not retried any more (0: no deadline).
+        public retryUntilUnix: long = 0
+        // The queue and connection to push to ("" for the defaults).
+        public queueName: string = ""
+        public connectionName: string = ""
+        // Seconds to wait before it may run.
+        public delaySeconds: long = 0
+        // Fail (rather than retry) when an attempt times out.
+        public failOnTimeout: bool = false
+        // Drop it quietly when a model it carries no longer exists.
+        public deleteWhenMissingModels: bool = false
+        // How it runs right now (set by the worker; never queued).
+        @Transient public state: JobState = null
+
+        // ── settings, chained ──────────────────────────────────────────────────
+        fn onQueue(queue: string) -> Job { self.queueName = queue; return self; }
+        fn onConnection(connection: string) -> Job { self.connectionName = connection; return self; }
+        fn delay(seconds: long) -> Job { self.delaySeconds = seconds; return self; }
+        fn delayUntil(when: Moment) -> Job { let d = Moment.now().diffInSeconds(when, false); self.delaySeconds = d < 0 ? 0 : d; return self; }
+        fn delayFor(i: Interval) -> Job { self.delaySeconds = i.totalSeconds(); return self; }
+        fn retryUntil(when: Moment) -> Job { self.retryUntilUnix = when.unix(); return self; }
+        fn withTries(n: int) -> Job { self.tries = n; return self; }
+        fn withTimeout(seconds: int) -> Job { self.timeout = seconds; return self; }
+        fn withBackoff(seconds: Array<int>) -> Job { self.backoff = seconds; return self; }
+
+        // ── what a job may override ────────────────────────────────────────────
+        // A key for unique jobs: while one with this key is queued (or running),
+        // dispatching another does nothing. "" (the default): not unique.
+        fn uniqueId() -> string { return ""; }
+        // Seconds the uniqueness lasts at most (0: until the job finishes).
+        fn uniqueFor() -> long { return 0; }
+        // Release uniqueness when the job starts, not when it finishes.
+        fn uniqueUntilProcessing() -> bool { return false; }
+        // Middleware around handle() (rate limits, no overlapping, …).
+        fn middleware() -> Array<JobMiddleware> { return new Array<JobMiddleware>(); }
+        // Tags for monitoring (shown in failed-job records).
+        fn tags() -> Array<string> { return new Array<string>(); }
+        // The name shown in logs and failed-job records.
+        fn displayName() -> string { return ClassInfo.of(self).name; }
+        // Called once when the job has failed for good.
+        fn failed(e: Exception) {}
+
+        // ── while it runs ──────────────────────────────────────────────────────
+        // Which attempt this is (1 for the first).
+        fn attempts() -> int { return self.state == null ? 0 : self.state.attempts; }
+        fn jobId() -> string { return self.state == null ? "" : self.state.id; }
+        // Puts it back on the queue, to run again after `seconds` (counts as an attempt).
+        fn release(seconds: long = 0) { if (self.state != null) { self.state.released = true; self.state.releaseDelay = seconds; } }
+        // Fails it now, for good.
+        fn fail(reason: string = "the job failed") { if (self.state != null) { self.state.failure = new ManuallyFailedException(reason); } }
+        // Removes it from the queue without running the rest (or failing it).
+        fn delete() { if (self.state != null) { self.state.deleted = true; } }
+        fn isReleased() -> bool { return self.state != null && self.state.released; }
+        fn isDeleted() -> bool { return self.state != null && self.state.deleted; }
+        // The batch it belongs to (null when none).
+        fn batch() -> Batch { return self.state == null || self.state.batches == null || self.state.batchId == "" ? null : self.state.batches.find(self.state.batchId); }
+        fn batchId() -> string { return self.state == null ? "" : self.state.batchId; }
+        // Seconds to wait before retry number `attempt` (1 for the first retry).
+        fn backoffFor(attempt: int, fallback: Array<int>) -> long {
+            let list = self.backoff.size() > 0 ? self.backoff : fallback;
+            if (list.size() == 0) { return 0; }
+            let i = attempt - 1 < list.size() ? attempt - 1 : list.size() - 1;
+            return (i < 0 ? list[0] : list[i]) as long;
+        }
+    }
+
+    // A job's runtime: which attempt, what it asked for (release, delete, fail).
+    class JobState {
+        public id: string = ""
+        public attempts: int = 0
+        public queue: string = ""
+        public connection: string = ""
+        public released: bool = false
+        public releaseDelay: long = 0
+        public deleted: bool = false
+        public failure: Exception = null
+        public batchId: string = ""
+        public batches: BatchRepository = null
+        constructor() {}
+    }
+
+    // Something that runs around a job's handle(): call next(job) to go on, or
+    // don't (after job.release(…) or job.delete()) to stop it here.
+    interface JobMiddleware {
+        fn handle(job: Job, next: fn(Job))
+    }
+
+    // job.fail(...) was called.
+    class ManuallyFailedException extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "ManuallyFailedException"; }
+    }
+    // It ran out of attempts.
+    class MaxAttemptsExceededException extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "MaxAttemptsExceededException"; }
+    }
+    // An attempt took longer than its timeout.
+    class TimeoutExceededException extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "TimeoutExceededException"; }
+    }
+
+    // ── middleware ───────────────────────────────────────────────────────────────
+
+    // At most `maxAttempts` runs of jobs sharing `key` per `decaySeconds`; a job
+    // over the limit goes back on the queue until the window opens.
+    //
+    //   fn middleware() -> Array<JobMiddleware> { return [new RateLimitedJob("mailgun", 100, 60)] }
+    class RateLimitedJob implements JobMiddleware {
+        public key: string
+        public maxAttempts: long
+        public decaySeconds: long
+        // Delete the job instead of releasing it when over the limit.
+        public dropWhenLimited: bool = false
+        private limiter: RateLimiter
+        constructor(key: string, maxAttempts: long, decaySeconds: long = 60, cache: CacheRepository = null) {
+            self.key = key; self.maxAttempts = maxAttempts; self.decaySeconds = decaySeconds;
+            self.limiter = (cache == null ? Cache.repository() : cache).limiter();
+        }
+        fn dontRelease() -> RateLimitedJob { self.dropWhenLimited = true; return self; }
+        fn handle(job: Job, next: fn(Job)) {
+            let k = "job-limit:" + self.key;
+            if (self.limiter.tooManyAttempts(k, self.maxAttempts)) {
+                if (self.dropWhenLimited) { job.delete(); } else { job.release(self.limiter.availableIn(k) + 1); }
+                return;
+            }
+            self.limiter.hit(k, self.decaySeconds);
+            next(job);
+        }
+    }
+
+    // Only one job with `key` runs at a time (a cache lock); another goes back on
+    // the queue for `releaseAfter` seconds (or is dropped with dontRelease()).
+    class WithoutOverlapping implements JobMiddleware {
+        public key: string
+        public releaseAfter: long
+        // The lock lapses after this many seconds even if the job never finishes (0: never).
+        public expireAfter: long
+        public dropWhenLocked: bool = false
+        private cache: CacheRepository
+        constructor(key: string, releaseAfter: long = 0, expireAfter: long = 0, cache: CacheRepository = null) {
+            self.key = key; self.releaseAfter = releaseAfter; self.expireAfter = expireAfter;
+            self.cache = cache == null ? Cache.repository() : cache;
+        }
+        fn dontRelease() -> WithoutOverlapping { self.dropWhenLocked = true; return self; }
+        fn handle(job: Job, next: fn(Job)) {
+            let lock = self.cache.lock("job-overlap:" + self.key, self.expireAfter);
+            if (!lock.get()) {
+                if (self.dropWhenLocked) { job.delete(); } else { job.release(self.releaseAfter); }
+                return;
+            }
+            try { next(job); } finally { lock.release(); }
+        }
+    }
+
+    // After `maxAttempts` exceptions from jobs sharing `key` within `decaySeconds`,
+    // the next ones go back on the queue for `decaySeconds` instead of hammering
+    // a failing service.
+    class ThrottlesExceptions implements JobMiddleware {
+        public key: string
+        public maxAttempts: long
+        public decaySeconds: long
+        private limiter: RateLimiter
+        constructor(key: string, maxAttempts: long = 10, decaySeconds: long = 600, cache: CacheRepository = null) {
+            self.key = key; self.maxAttempts = maxAttempts; self.decaySeconds = decaySeconds;
+            self.limiter = (cache == null ? Cache.repository() : cache).limiter();
+        }
+        fn handle(job: Job, next: fn(Job)) {
+            let k = "job-exceptions:" + self.key;
+            if (self.limiter.tooManyAttempts(k, self.maxAttempts)) { job.release(self.limiter.availableIn(k) + 1); return; }
+            try {
+                next(job);
+                self.limiter.clear(k);
+            } catch (e: Exception) {
+                self.limiter.hit(k, self.decaySeconds);
+                throw e;
+            }
+        }
+    }
+
+    // Jobs of a cancelled batch end here without running.
+    class SkipIfBatchCancelled implements JobMiddleware {
+        constructor() {}
+        fn handle(job: Job, next: fn(Job)) {
+            let b = job.batch();
+            if (b != null && b.cancelled()) { return; }
+            next(job);
+        }
+    }
+
+    // Runs the job only when `check` says so (otherwise it is deleted).
+    class SkipUnless implements JobMiddleware {
+        private check: fn(Job) -> bool
+        constructor(check: fn(Job) -> bool) { self.check = check; }
+        fn handle(job: Job, next: fn(Job)) { if (self.check(job)) { next(job); } else { job.delete(); } }
+    }
+}
