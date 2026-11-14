@@ -46,7 +46,7 @@ A job extends `Job`:
 |---|---|
 | Plain values | numbers, text, bools, `T?`, enums |
 | Dates and money | `Moment`, `DateTime`, `Decimal` |
-| Collections | `Array`/`HashMap` of any of these |
+| Collections | `Array`/`HashMap` of the plain values above, or `Array<any>`/`HashMap<string, any>` of anything here (objects in a list go in an `Array<any>`: an `Array<Address>` cannot be rebuilt through reflection) |
 | Reflected objects | travel field by field |
 | Models | travel by id |
 
