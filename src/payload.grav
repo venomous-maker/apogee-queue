@@ -2,8 +2,8 @@
 // and back into a job on the worker.
 //
 // A field can hold what JSON can (numbers, text, bools, null), an enum, a
-// Moment or DateTime or Decimal, an Array or HashMap of those (any element
-// type the field names: Array<string>, HashMap<string, any>, …), another
+// Moment or DateTime or Decimal, an Array or HashMap of those or of objects
+// (any element type the field names: Array<Address>, HashMap<string, any>, …), another
 // reflected object (its fields, the same way), or a model: a QueueableEntity
 // travels as its class and id, and is fetched again on the worker (fresh,
 // as Laravel's SerializesModels does) through JobCodec.entityResolver.
@@ -128,13 +128,12 @@ namespace apogee {
             if (v is Array<int>) { sb.append("["); for (i, x in v as Array<int>) { if (i > 0) { sb.append(","); } sb.appendInt(x as long); } sb.append("]"); return; }
             if (v is Array<double>) { sb.append("["); for (i, x in v as Array<double>) { if (i > 0) { sb.append(","); } sb.appendFloat(x); } sb.append("]"); return; }
             if (v is Array<bool>) { sb.append("["); for (i, x in v as Array<bool>) { if (i > 0) { sb.append(","); } sb.append(x ? "true" : "false"); } sb.append("]"); return; }
-            if (v is Array<Moment>) { let l = new Array<any>(); for (x in v as Array<Moment>) { l.push(x); } JobCodec.writeList(sb, l, depth); return; }
             if (v is HashMap<string, any>) { JobCodec.writeMap(sb, v as HashMap<string, any>, depth); return; }
-            if (v is HashMap<string, string>) { let m = new HashMap<string, any>(); (v as HashMap<string, string>).forEach(fn(k: string, x: string) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
-            if (v is HashMap<string, long>) { let m = new HashMap<string, any>(); (v as HashMap<string, long>).forEach(fn(k: string, x: long) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
-            if (v is HashMap<string, int>) { let m = new HashMap<string, any>(); (v as HashMap<string, int>).forEach(fn(k: string, x: int) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
-            if (v is HashMap<string, double>) { let m = new HashMap<string, any>(); (v as HashMap<string, double>).forEach(fn(k: string, x: double) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
-            if (v is HashMap<string, bool>) { let m = new HashMap<string, any>(); (v as HashMap<string, bool>).forEach(fn(k: string, x: bool) { m.put(k, x); }); JobCodec.writeMap(sb, m, depth); return; }
+            // (a list or map of any other type: Array<Address>, HashMap<string, Moment>, …)
+            let items = ClassInfo.listItems(v);
+            if (items != null) { JobCodec.writeList(sb, items, depth); return; }
+            let entries = ClassInfo.mapEntries(v);
+            if (entries != null) { JobCodec.writeMap(sb, entries, depth); return; }
             if (v is JsonValue) { sb.append("{\"$json\":").append((v as JsonValue).toJson()).append("}"); return; }
             let info = ClassInfo.of(v);
             let keyOf = JobCodec.entityKey;
@@ -245,7 +244,7 @@ namespace apogee {
                 if (el == "int") { let a = new Array<int>(); for (x in items) { a.push(x.asInt()); } return a; }
                 if (el == "double" || el == "float") { let a = new Array<double>(); for (x in items) { a.push(x.asFloat()); } return a; }
                 if (el == "bool") { let a = new Array<bool>(); for (x in items) { a.push(x.asBool()); } return a; }
-                if (el == "apogee.Moment" || el == "Moment") { let a = new Array<Moment>(); for (x in items) { a.push(JobCodec.plain(x) as Moment); } return a; }
+                // (any other list: its items as values, which FieldInfo.set makes an Array<Address> or Array<Moment>)
                 let a = new Array<any>();
                 for (x in items) { a.push(JobCodec.plain(x)); }
                 return a;

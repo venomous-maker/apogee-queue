@@ -44,6 +44,10 @@ class Everything extends Job {
     public address: Address = null
     public customer: Customer = null
     public maybe: long? = null
+    public stops: Array<Address> = new Array<Address>()
+    public byCode: HashMap<string, Address> = new HashMap<string, Address>()
+    public dates: Array<Moment> = new Array<Moment>()
+    public grid: Array<Array<long>> = new Array<Array<long>>()
     @Transient public cache: string = "not queued"
     constructor() {}
     fn handle() {}
@@ -148,6 +152,9 @@ test "payloads: every kind of field travels, models by id, transient fields stay
     j.meta = {"plan": "pro", "seats": 5, "nested": {"on": true}, "$odd": "key"}
     j.address = new Address(); j.address.city = "Nairobi"; j.address.zip = 100
     j.customer = ada; j.maybe = 42; j.cache = "changed"
+    let mombasa = new Address(); mombasa.city = "Mombasa"; mombasa.zip = 80100
+    j.stops = [j.address, mombasa]; j.byCode.put("msa", mombasa)
+    j.dates = [Moment.parse("2026-01-02", "UTC")]; j.grid = [[1, 2], [3]]
     j.tries = 4; j.backoff = [5, 30]
     j.onQueue("reports")
     let raw = JobCodec.encode(j)
@@ -159,6 +166,8 @@ test "payloads: every kind of field travels, models by id, transient fields stay
     assertEq("${back.when.format("Y-m-d H:i:s e")} ${back.tagsList} ${back.numbers}", "2026-11-14 09:30:15 Africa/Nairobi [\"x\", \"y\"] [1, 2, 3]")
     assertEq("${back.meta["plan"]} ${back.meta["seats"]} ${(back.meta["nested"] as HashMap<string, any>)["on"]} ${back.meta["$odd"]}", "pro 5 true key")
     assertEq("${back.address.city} ${back.address.zip} ${back.customer.name} ${back.maybe} ${back.cache}", "Nairobi 100 Ada L. 42 not queued")
+    assertEq("${back.stops.size()} " + back.stops[1].city + " ${back.byCode.get("msa").zip}", "2 Mombasa 80100")   // (lists and maps of objects)
+    assertEq(back.dates[0].toDateString() + " ${back.grid}", "2026-01-02 [[1, 2], [3]]")
     customers.remove("7")
     let missing = ""
     try { JobCodec.rebuild(JobCodec.read(raw)) } catch (e: ModelNotFoundException) { missing = e.message() }
