@@ -1,0 +1,2 @@
+# grav.lock: exact commits of the installed dependencies (generated; commit this file)
+grav-orbit = { source = "github.com/venomous-maker/grav-orbit", version = "", commit = "27d531ea748eccad9342feb94de17e0b487d753e" }

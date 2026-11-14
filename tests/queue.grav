@@ -1,0 +1,421 @@
+// apogee-queue's tests: payloads, sync and memory dispatch, workers (retries,
+// backoff, failures, release/delete/fail from a job, timeouts, limits),
+// middleware, chains, batches, unique jobs, queued listeners, the fake, and
+// the Redis (REDIS_URL, default redis://127.0.0.1:6379/9) and SQLite drivers
+// under concurrent workers.
+import "std"
+import "grav-redis"
+import "grav-db"
+import "../src/all.grav"
+use apogee.*
+use redis.*
+use db.*
+
+// What jobs did, for the tests to read (thread-safe).
+class Trace {
+    static lines: Array<string> = new Array<string>()
+    static lock: Mutex = new Mutex()
+    static counter: AtomicInt = new AtomicInt(0)
+    static fn add(s: string) { Trace.lock.lock(); Trace.lines.push(s); Trace.lock.unlock() }
+    static fn text() -> string { Trace.lock.lock(); let t = Str.join(Trace.lines, ","); Trace.lock.unlock(); return t }
+    static fn reset() { Trace.lock.lock(); Trace.lines = new Array<string>(); Trace.lock.unlock(); Trace.counter.set(0) }
+}
+
+class Greeter { public greeting: string = "hello"  constructor() {} }
+
+enum Priority { Low, Normal, High }
+@Shape class Address { public city: string = ""  public zip: long = 0  constructor() {} }
+@Shape class Customer implements QueueableEntity {
+    public id: long = 0  public name: string = ""
+    constructor() {}
+    fn queueableId() -> string { return "${self.id}" }
+}
+
+class Everything extends Job {
+    public text: string = ""
+    public count: long = 0
+    public ratio: double = 0.0
+    public flag: bool = false
+    public level: Priority = Priority.Low
+    public when: Moment = null
+    public tagsList: Array<string> = new Array<string>()
+    public numbers: Array<long> = new Array<long>()
+    public meta: HashMap<string, any> = new HashMap<string, any>()
+    public address: Address = null
+    public customer: Customer = null
+    public maybe: long? = null
+    @Transient public cache: string = "not queued"
+    constructor() {}
+    fn handle() {}
+}
+
+class Hello extends Job {
+    public who: string = ""
+    constructor(who: string = "") { self.who = who }
+    fn handle(g: Greeter) { Trace.add(g.greeting + " " + self.who) }
+}
+class Flaky extends Job {
+    public failTimes: int = 0
+    constructor(failTimes: int = 0) { self.failTimes = failTimes; self.tries = 3; self.backoff = [0, 0] }
+    fn handle() {
+        Trace.add("try${self.attempts()}")
+        if (self.attempts() <= self.failTimes) { throw new StateError("boom ${self.attempts()}") }
+    }
+    fn failed(e: Exception) { Trace.add("failed:" + e.message()) }
+}
+class SelfControl extends Job {
+    public action: string = ""
+    constructor(action: string = "") { self.action = action }
+    fn handle() {
+        Trace.add(self.action + "${self.attempts()}")
+        if (self.action == "release" && self.attempts() == 1) { self.release(0) }
+        if (self.action == "fail") { self.fail("not today") }
+        if (self.action == "delete") { self.delete() }
+    }
+}
+class Step extends Job {
+    public name: string = ""
+    public explode: bool = false
+    constructor(name: string = "", explode: bool = false) { self.name = name; self.explode = explode }
+    fn handle() { Trace.add(self.name); if (self.explode) { throw new StateError("step " + self.name) } }
+}
+class Slow extends Job {
+    public ms: long = 0
+    constructor(ms: long = 0) { self.ms = ms; self.timeout = 1 }
+    fn handle() { Time.sleepMs(self.ms); Trace.add("slow done") }
+}
+class Unique extends Job {
+    public key: string = ""
+    constructor(key: string = "") { self.key = key }
+    fn uniqueId() -> string { return self.key }
+    fn handle() { Trace.add("unique " + self.key) }
+}
+class Guarded extends Job {
+    public n: int = 0
+    constructor(n: int = 0) { self.n = n }
+    fn middleware() -> Array<JobMiddleware> { return [new RateLimitedJob("api", 2, 60) as JobMiddleware] }
+    fn handle() { Trace.add("guarded${self.n}") }
+}
+class Counted extends Job {
+    constructor() {}
+    fn handle() { Trace.counter.increment() }
+}
+class BatchPart extends Job {
+    public n: int = 0
+    public bad: bool = false
+    constructor(n: int = 0, bad: bool = false) { self.n = n; self.bad = bad }
+    fn handle() {
+        let b = self.batch()
+        Trace.add("part${self.n}:" + (b == null ? "none" : b.name))
+        if (self.bad) { throw new StateError("bad part") }
+    }
+}
+
+@Event class OrderShipped { public orderId: long = 0  constructor(id: long = 0) { self.orderId = id } }
+class EmailCustomer extends Listener {
+    constructor() {}
+    fn shouldQueue() -> bool { return true }
+    fn queue() -> string { return "listeners" }
+    fn handle(e: OrderShipped) { Trace.add("emailed for ${e.orderId}") }
+}
+
+fn manager() -> QueueManager {
+    let c = new Container()
+    c.instance::<Greeter>(new Greeter())
+    let q = new QueueManager(c)
+    q.addConnection("memory", new MemoryQueueDriver())
+    q.defaultConnection = "memory"
+    Cache.store(new MemoryCacheStore())
+    Trace.reset()
+    return q
+}
+fn quiet() -> WorkerOptions { let o = new WorkerOptions(); o.sleep = 0.05; o.memoryMb = 0; return o }
+fn drain(q: QueueManager, queues: Array<string> = ["default"]) -> int {
+    let o = quiet()
+    o.stopWhenEmpty = true
+    return q.worker().work("memory", queues, o)
+}
+
+test "payloads: every kind of field travels, models by id, transient fields stay" {
+    let customers = new HashMap<string, Customer>()
+    let ada = new Customer(); ada.id = 7; ada.name = "Ada"
+    customers.put("7", ada)
+    JobCodec.entityResolver = fn(cls: string, id: string) -> any { return customers.getOr(id, null) }
+    let j = new Everything()
+    j.text = "a \"quoted\" line\n"; j.count = 9000000000; j.ratio = 0.25; j.flag = true; j.level = Priority.High
+    j.when = Moment.parse("2026-11-14 09:30:15", "Africa/Nairobi")
+    j.tagsList = ["x", "y"]; j.numbers = [1, 2, 3]
+    j.meta = {"plan": "pro", "seats": 5, "nested": {"on": true}, "$odd": "key"}
+    j.address = new Address(); j.address.city = "Nairobi"; j.address.zip = 100
+    j.customer = ada; j.maybe = 42; j.cache = "changed"
+    j.tries = 4; j.backoff = [5, 30]
+    j.onQueue("reports")
+    let raw = JobCodec.encode(j)
+    let p = JobCodec.read(raw)
+    assertEq("${p.jobClass} ${p.queue} ${p.maxTries} ${p.backoff}", "Everything reports 4 [5, 30]")
+    ada.name = "Ada L."                                        // fetched fresh on the worker
+    let back = JobCodec.rebuild(p) as Everything
+    assertEq("${back.text == j.text} ${back.count} ${back.ratio} ${back.flag} ${back.level == Priority.High}", "true 9000000000 0.25 true true")
+    assertEq("${back.when.format("Y-m-d H:i:s e")} ${back.tagsList} ${back.numbers}", "2026-11-14 09:30:15 Africa/Nairobi [\"x\", \"y\"] [1, 2, 3]")
+    assertEq("${back.meta["plan"]} ${back.meta["seats"]} ${(back.meta["nested"] as HashMap<string, any>)["on"]} ${back.meta["$odd"]}", "pro 5 true key")
+    assertEq("${back.address.city} ${back.address.zip} ${back.customer.name} ${back.maybe} ${back.cache}", "Nairobi 100 Ada L. 42 not queued")
+    customers.remove("7")
+    let missing = ""
+    try { JobCodec.rebuild(JobCodec.read(raw)) } catch (e: ModelNotFoundException) { missing = e.message() }
+    assertEq(Str.contains(missing, "no Customer with id 7"), true)
+    JobCodec.entityResolver = null
+}
+
+test "sync: runs at once, with the container's help; its exception reaches the caller" {
+    let q = manager()
+    q.defaultConnection = "sync"
+    q.dispatch(new Hello("ada"))
+    assertEq(Trace.text(), "hello ada")
+    let msg = ""
+    try { q.dispatch(new Flaky(5)) } catch (e: StateError) { msg = e.message() }
+    assertEq("${msg} ${q.failedJobs.count()}", "boom 1 1")
+    q.dispatchAfterResponse(new Hello("later"))
+    assertEq(Str.contains(Trace.text(), "later"), false)
+    q.runAfterResponse()
+    assertEq(Str.endsWith(Trace.text(), "hello later"), true)
+}
+
+test "workers: retries with backoff, failure after the last try, retrying a failed job" {
+    let q = manager()
+    q.dispatch(new Flaky(1))
+    q.dispatch(new Flaky(5))
+    assertEq(q.size(), 2)
+    drain(q)
+    assertEq(Trace.text(), "try1,try1,try2,try2,try3,failed:boom 3")
+    let failed = q.failedJobs.all()
+    assertEq("${failed.size()} ${failed[0].jobClass()} ${Str.contains(failed[0].exception, "StateError: boom 3")}", "1 Flaky true")
+    Trace.reset()
+    assertEq(q.retry(failed[0].id), true)
+    drain(q)
+    assertEq("${Trace.text()} ${q.failedJobs.count()}", "try1,try2,try3,failed:boom 3 1")   // the payload keeps its data
+    let w = q.worker()
+    assertEq(w.stats.processed >= 1 && w.stats.failed >= 2 && w.stats.released >= 3, true)
+}
+
+test "workers: delays, release/fail/delete from the job, attempts before running" {
+    let q = manager()
+    q.dispatch(new Hello("soon").delay(1))
+    assertEq("${q.size()} ${q.connection().delayedSize("default")}", "0 1")
+    drain(q)
+    assertEq(Trace.text(), "")
+    Time.sleepMs(1100)
+    drain(q)
+    assertEq(Trace.text(), "hello soon")
+    Trace.reset()
+    q.dispatch(new SelfControl("release"))
+    q.dispatch(new SelfControl("fail"))
+    q.dispatch(new SelfControl("delete"))
+    let o = quiet(); o.stopWhenEmpty = true; o.tries = 5
+    q.worker().work("memory", ["default"], o)
+    assertEq(Trace.text(), "release1,fail1,delete1,release2")
+    assertEq(q.failedJobs.count(), 1)
+    let tooMany = new Hello("x"); tooMany.tries = 1
+    q.dispatch(tooMany)
+    let r = q.connection().pop("default", 90)
+    q.connection().release(r, 0)                               // (a crash after the first attempt)
+    drain(q)
+    assertEq(Str.contains(q.failedJobs.all()[0].exception, "attempted too many times"), true)
+}
+
+test "timeouts stop the worker, and the job is retried or failed" {
+    let q = manager()
+    let j = new Slow(1500)
+    j.tries = 1
+    q.dispatch(j)
+    let code = drain(q)
+    assertEq("${code} ${q.failedJobs.count()} ${Str.contains(q.failedJobs.all()[0].exception, "TimeoutExceededException")}", "1 1 true")
+    Time.sleepMs(700)                                           // (the abandoned attempt finishes, away from later tests)
+}
+
+test "middleware: rate limited jobs come back later" {
+    let q = manager()
+    for (i in 1..=3) { q.dispatch(new Guarded(i)) }
+    let o = quiet(); o.maxJobs = 3
+    q.worker().work("memory", ["default"], o)
+    assertEq("${Trace.text()} ${q.connection().delayedSize("default")}", "guarded1,guarded2 1")
+}
+
+test "chains run in order; a failure stops them and runs the catch" {
+    let q = manager()
+    q.chain([new Step("a") as Job, new Step("b"), new Step("c")]).onQueue("chains").dispatch()
+    drain(q, ["chains"])
+    assertEq(Trace.text(), "a,b,c")
+    Trace.reset()
+    let first = new Step("x"); first.tries = 1
+    let bad = new Step("y", true); bad.tries = 1
+    q.chain([first as Job, bad, new Step("z")]).catch(new Step("caught")).dispatch()
+    drain(q)
+    assertEq(Trace.text(), "x,y,caught")
+    Trace.reset()
+    q.defaultConnection = "sync"
+    q.chain([new Step("s1") as Job, new Step("s2")]).dispatch()
+    assertEq(Trace.text(), "s1,s2")
+}
+
+test "batches: progress, then/catch/finally, allowFailures" {
+    let q = manager()
+    let b = q.batch([new BatchPart(1) as Job, new BatchPart(2), new BatchPart(3)]).name("import").then(new Step("then")).finally(new Step("finally")).dispatch()
+    assertEq("${b.totalJobs} ${b.pendingJobs} ${b.progress()}", "3 3 0")
+    drain(q)
+    let done = q.findBatch(b.id)
+    assertEq("${done.progress()} ${done.finished()} ${done.hasFailures()} ${Trace.text()}", "100 true false part1:import,part2:import,part3:import,then,finally")
+    Trace.reset()
+    let bad = new BatchPart(2, true); bad.tries = 1
+    let b2 = q.batch([new BatchPart(1) as Job, bad]).name("risky").then(new Step("then")).catch(new Step("catch")).finally(new Step("finally")).dispatch()
+    drain(q)
+    let after = q.findBatch(b2.id)
+    assertEq("${after.failedJobs} ${after.cancelled()} ${Trace.text()}", "1 true part1:risky,part2:risky,catch,finally")
+    Trace.reset()
+    let bad2 = new BatchPart(2, true); bad2.tries = 1
+    q.batch([new BatchPart(1) as Job, bad2]).allowFailures().then(new Step("then anyway")).dispatch()
+    drain(q)
+    assertEq(Trace.text(), "part1:,part2:,then anyway")
+}
+
+test "unique jobs are queued once until they run" {
+    let q = manager()
+    assertEq("${q.dispatch(new Unique("report")) != ""} ${q.dispatch(new Unique("report"))} ${q.dispatch(new Unique("other")) != ""}", "true  true")
+    drain(q)
+    assertEq(q.dispatch(new Unique("report")) != "", true)    // free again
+}
+
+test "queued listeners run on the worker, with the event" {
+    let q = manager()
+    let events = new Events(q.container)
+    events.discover()
+    q.queueListenersOf(events)
+    events.dispatch(new OrderShipped(42))
+    assertEq("${Trace.text()} ${q.size("listeners")}", " 1")
+    drain(q, ["listeners"])
+    assertEq(Trace.text(), "emailed for 42")
+}
+
+test "events: processing, processed, failed" {
+    let q = manager()
+    let events = new Events(q.container)
+    q.events = events
+    events.listen::<JobProcessed>(fn(e: JobProcessed) { Trace.add("processed " + e.job) })
+    events.listen::<JobFailed>(fn(e: JobFailed) { Trace.add("failed " + e.job + " " + e.exception.message()) })
+    q.dispatch(new Hello("ev"))
+    let bad = new Step("e", true); bad.tries = 1
+    q.dispatch(bad)
+    drain(q)
+    assertEq(Trace.text(), "hello ev,processed Hello,e,failed Step step e")
+}
+
+test "the fake records instead of running" {
+    let q = manager()
+    q.fake()
+    q.dispatch(new Hello("ada").onQueue("mail"))
+    q.dispatch(new Hello("bob"))
+    q.chain([new Step("a") as Job, new Step("b"), new Hello("c")]).dispatch()
+    q.batch([new Step("x") as Job]).name("b1").dispatch()
+    q.assertPushed::<Hello>(2)
+    q.assertPushedOn::<Hello>("mail")
+    q.assertPushedWhere::<Hello>(fn(h: Hello) -> bool { return h.who == "bob" })
+    q.assertPushedWithChain::<Step>(["Step", "Hello"])
+    q.assertNotPushed::<Flaky>()
+    q.assertBatched(fn(b: PendingBatch) -> bool { return b.batchName == "b1" && b.jobs.size() == 1 })
+    q.assertBatchCount(1)
+    let caught = false
+    try { q.assertPushed::<Flaky>() } catch (e: AssertionError) { caught = true }
+    assertEq("${caught} ${Trace.text()} ${q.size()}", "true  0")
+}
+
+fn redisUrl() -> string { let u = env("REDIS_URL"); return u == "" ? "redis://127.0.0.1:6379/9" : u }
+
+test "the Redis driver: delays, releases, reservations that lapse, many workers at once" {
+    let q = manager()
+    let driver = RedisQueueDriver.open(redisUrl(), 8, "test-queues:")
+    q.addConnection("redis", driver)
+    q.defaultConnection = "redis"
+    driver.clear("default")
+    q.dispatch(new Hello("redis"))
+    q.dispatch(new Hello("later").delay(1))
+    let o = quiet(); o.stopWhenEmpty = true
+    q.worker().work("redis", ["default"], o)
+    assertEq("${Trace.text()} ${driver.delayedSize("default")}", "hello redis 1")
+    Time.sleepMs(1100)
+    q.worker().work("redis", ["default"], o)
+    assertEq(Trace.text(), "hello redis,hello later")
+    // a reservation that lapses (a worker that died) comes back
+    q.dispatch(new Hello("again"))
+    let r = driver.pop("default", 1)
+    assertEq("${r.attempts} ${driver.reservedSize("default")} ${driver.size("default")}", "1 1 0")
+    Time.sleepMs(1100)
+    let r2 = driver.pop("default", 1)
+    assertEq("${r2.attempts} ${r2.id == r.id}", "2 true")
+    driver.delete(r2)
+    // 400 jobs, 8 threads
+    Trace.reset()
+    let jobs = new Array<Job>()
+    for (i in 0..400) { jobs.push(new Counted()) }
+    q.bulk(jobs)
+    assertEq(driver.size("default"), 400)
+    let many = quiet(); many.stopWhenEmpty = true
+    let sw = new Stopwatch()
+    q.worker().workConcurrently(8, "redis", ["default"], many)
+    assertEq("${Trace.counter.get()} ${driver.size("default")} ${driver.reservedSize("default")}", "400 0 0")
+    print("  (400 Redis jobs on 8 threads: ${sw.elapsedMs()} ms)")
+    driver.clear("default")
+}
+
+test "the database driver (SQLite): claims, releases, failures in a table" {
+    let path = Path.combine(Dir.temp(), "apogee-queue-test.db")
+    new File(path).delete()
+    let pool = new Pool(4, fn() -> Connection { let c = Sqlite.open(path); c.exec("PRAGMA busy_timeout = 5000"); return c })
+    let jobs = new DatabaseQueueDriver(pool)
+    jobs.createTable()
+    let failedStore = new DatabaseFailedJobStore(pool)
+    failedStore.createTable()
+    let q = manager()
+    q.addConnection("database", jobs)
+    q.defaultConnection = "database"
+    q.failedJobs = failedStore
+    q.dispatch(new Hello("db"))
+    q.dispatch(new Flaky(1))
+    let bad = new Step("dead", true); bad.tries = 1
+    q.dispatch(bad)
+    let o = quiet(); o.stopWhenEmpty = true
+    q.worker().work("database", ["default"], o)
+    assertEq(Trace.text(), "hello db,try1,try2,dead")      // (a retry with no backoff comes before a later job)
+    assertEq("${failedStore.count()} ${failedStore.all()[0].jobClass()} ${jobs.size("default")} ${jobs.reservedSize("default")}", "1 Step 0 0")
+    Trace.reset()
+    let batch = new Array<Job>()
+    for (i in 0..60) { batch.push(new Counted()) }
+    q.bulk(batch)
+    q.worker().workConcurrently(3, "database", ["default"], o)
+    assertEq("${Trace.counter.get()} ${jobs.size("default")}", "60 0")
+    assertEq(failedStore.flush(), 1)
+    pool.close()
+    new File(path).delete()
+}
+
+test "failed jobs in a file" {
+    let path = Path.combine(Dir.temp(), "apogee-failed.jsonl")
+    new File(path).delete()
+    let store = new FileFailedJobStore(path)
+    let id = store.record("redis", "mail", JobCodec.encode(new Hello("x")), "StateError: nope")
+    assertEq("${store.count()} ${store.find(id).queue} ${store.find(id).jobClass()}", "1 mail Hello")
+    assertEq("${store.forget(id)} ${store.count()}", "true 0")
+    new File(path).delete()
+}
+
+test "the worker stops on maxJobs, and on queue:restart" {
+    let q = manager()
+    for (i in 0..5) { q.dispatch(new Counted()) }
+    let o = quiet(); o.maxJobs = 2
+    q.worker().work("memory", ["default"], o)
+    assertEq(Trace.counter.get(), 2)
+    let w = new Worker(q)
+    let t = Thread.spawn(fn() { let o2 = quiet(); w.work("memory", ["default"], o2) })
+    Time.sleepMs(200)
+    Worker.signalRestart(q.cache)
+    t.join()
+    assertEq(Trace.counter.get(), 5)
+}
