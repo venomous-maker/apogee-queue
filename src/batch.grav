@@ -1,0 +1,142 @@
+// batch.grav — batches: many jobs run as one unit, with progress, and jobs to
+// run when all of them are done (then), when one fails (catch), and either
+// way (finally).
+//
+//   let b = queue.batch([new ImportRows(0), new ImportRows(1000), new ImportRows(2000)])
+//       .name("import #42")
+//       .then(new NotifyImportDone(42))
+//       .catch(new NotifyImportFailed(42))
+//       .allowFailures()
+//       .dispatch()
+//   queue.findBatch(b.id).progress()            // 0..100
+//
+// The counts live in a cache store: atomic counters on Redis or in memory, so
+// many workers on many machines keep one batch's numbers right.
+import "std"
+import "grav-cache"
+import "apogee-support"
+
+namespace apogee {
+
+    class Batch {
+        public id: string
+        public name: string = ""
+        public totalJobs: long = 0
+        public pendingJobs: long = 0
+        public failedJobs: long = 0
+        public failedJobIds: Array<string>
+        public allowFailures: bool = false
+        // Payloads of the jobs to run at the end ("" for none).
+        public thenJob: string = ""
+        public catchJob: string = ""
+        public finallyJob: string = ""
+        public queue: string = ""
+        public connection: string = ""
+        public createdAt: long = 0
+        public cancelledAt: long = 0
+        public finishedAt: long = 0
+        public repository: BatchRepository = null
+
+        constructor(id: string) { self.id = id; self.failedJobIds = new Array<string>(); }
+        // Done jobs out of all, 0..100.
+        fn progress() -> int { return self.totalJobs == 0 ? 0 : ((self.processedJobs() * 100) / self.totalJobs) as int; }
+        fn processedJobs() -> long { return self.totalJobs - self.pendingJobs; }
+        fn finished() -> bool { return self.finishedAt > 0; }
+        fn cancelled() -> bool { return self.cancelledAt > 0; }
+        fn hasFailures() -> bool { return self.failedJobs > 0; }
+        // Stops the jobs not yet run (those that use SkipIfBatchCancelled, or check cancelled()).
+        fn cancel() { if (self.repository != null) { self.repository.cancel(self.id); } self.cancelledAt = Time.now(); }
+        fn fresh() -> Batch { return self.repository == null ? self : self.repository.find(self.id); }
+        fn toMap() -> HashMap<string, any> {
+            let m = new HashMap<string, any>();
+            m.put("id", self.id); m.put("name", self.name); m.put("totalJobs", self.totalJobs); m.put("pendingJobs", self.pendingJobs);
+            m.put("processedJobs", self.processedJobs()); m.put("progress", self.progress()); m.put("failedJobs", self.failedJobs);
+            m.put("createdAt", self.createdAt); m.put("cancelledAt", self.cancelledAt); m.put("finishedAt", self.finishedAt);
+            return m;
+        }
+    }
+
+    interface BatchRepository {
+        fn store(batch: Batch)
+        fn find(id: string) -> Batch
+        fn addJobs(id: string, n: long)
+        // One job done: [pending left, failed so far].
+        fn jobFinished(id: string, jobId: string) -> Array<long>
+        fn jobFailed(id: string, jobId: string) -> Array<long>
+        fn markFinished(id: string)
+        fn cancel(id: string)
+        fn delete(id: string)
+    }
+
+    // Batches in a cache store (memory for one process, Redis for many).
+    class CacheBatchRepository implements BatchRepository {
+        private store: CacheStore
+        private cache: CacheRepository
+        // Seconds a batch's records are kept (a week).
+        public keepFor: long = 604800
+        constructor(store: CacheStore) { self.store = store; self.cache = new CacheRepository(store); }
+        private fn k(id: string, part: string) -> string { return "batch:" + id + (part == "" ? "" : ":" + part); }
+        fn store(batch: Batch) {
+            let meta = new HashMap<string, any>();
+            meta.put("name", batch.name); meta.put("allowFailures", batch.allowFailures);
+            meta.put("then", batch.thenJob); meta.put("catch", batch.catchJob); meta.put("finally", batch.finallyJob);
+            meta.put("queue", batch.queue); meta.put("connection", batch.connection); meta.put("createdAt", batch.createdAt);
+            self.cache.put(self.k(batch.id, ""), meta, self.keepFor);
+            self.store.put(self.k(batch.id, "total"), "${batch.totalJobs}", self.keepFor);
+            self.store.put(self.k(batch.id, "pending"), "${batch.pendingJobs}", self.keepFor);
+            self.store.put(self.k(batch.id, "failed"), "0", self.keepFor);
+            self.cache.put(self.k(batch.id, "failedIds"), new Array<any>(), self.keepFor);
+        }
+        fn find(id: string) -> Batch {
+            let meta = self.cache.get(self.k(id, ""));
+            if (!(meta is HashMap<string, any>)) { return null; }
+            let m = meta as HashMap<string, any>;
+            let b = new Batch(id);
+            b.repository = self;
+            b.name = str(m.getOr("name", ""));
+            b.allowFailures = m.getOr("allowFailures", false) == true as any;
+            b.thenJob = str(m.getOr("then", ""));
+            b.catchJob = str(m.getOr("catch", ""));
+            b.finallyJob = str(m.getOr("finally", ""));
+            b.queue = str(m.getOr("queue", ""));
+            b.connection = str(m.getOr("connection", ""));
+            b.createdAt = Integer.parseOr(str(m.getOr("createdAt", 0)), 0);
+            b.totalJobs = self.number(self.k(id, "total"));
+            b.pendingJobs = self.number(self.k(id, "pending"));
+            b.failedJobs = self.number(self.k(id, "failed"));
+            b.cancelledAt = self.number(self.k(id, "cancelledAt"));
+            b.finishedAt = self.number(self.k(id, "finishedAt"));
+            let ids = self.cache.get(self.k(id, "failedIds"));
+            if (ids is Array<any>) { for (x in ids as Array<any>) { b.failedJobIds.push(str(x)); } }
+            return b;
+        }
+        private fn number(key: string) -> long { let v = self.store.get(key); return v == null ? 0 : Integer.parseOr(v, 0); }
+        fn addJobs(id: string, n: long) {
+            self.store.increment(self.k(id, "total"), n);
+            self.store.increment(self.k(id, "pending"), n);
+        }
+        fn jobFinished(id: string, jobId: string) -> Array<long> {
+            let pending = self.store.increment(self.k(id, "pending"), -1);
+            return [pending, self.number(self.k(id, "failed"))];
+        }
+        fn jobFailed(id: string, jobId: string) -> Array<long> {
+            let failed = self.store.increment(self.k(id, "failed"), 1);
+            // (the list of failed ids under a lock: appending is read, change, write)
+            let lock = self.cache.lock("batch-ids:" + id, 10);
+            lock.block(10);
+            try {
+                let ids = self.cache.get(self.k(id, "failedIds"));
+                let list = ids is Array<any> ? ids as Array<any> : new Array<any>();
+                list.push(jobId);
+                self.cache.put(self.k(id, "failedIds"), list, self.keepFor);
+            } finally { lock.release(); }
+            let pending = self.store.increment(self.k(id, "pending"), -1);
+            return [pending, failed];
+        }
+        fn markFinished(id: string) { self.store.put(self.k(id, "finishedAt"), "${Time.now()}", self.keepFor); }
+        fn cancel(id: string) { self.store.put(self.k(id, "cancelledAt"), "${Time.now()}", self.keepFor); }
+        fn delete(id: string) {
+            for (part in ["", "total", "pending", "failed", "failedIds", "cancelledAt", "finishedAt"]) { self.store.forget(self.k(id, part)); }
+        }
+    }
+}

@@ -1,0 +1,203 @@
+// failed.grav — where jobs that failed for good are kept, to look at, retry
+// (queue:retry) or forget: in memory, in a file (one JSON line each), or in
+// a table through grav-db.
+import "std"
+import "grav-db"
+import "apogee-support"
+
+namespace apogee {
+
+    class FailedJob {
+        public id: string
+        public uuid: string
+        public connection: string
+        public queue: string
+        public payload: string
+        // The exception's kind, message and trace.
+        public exception: string
+        // Unix seconds.
+        public failedAt: long
+        constructor(id: string, uuid: string, connection: string, queue: string, payload: string, exception: string, failedAt: long) {
+            self.id = id; self.uuid = uuid; self.connection = connection; self.queue = queue; self.payload = payload; self.exception = exception; self.failedAt = failedAt;
+        }
+        // The job's class, from its payload.
+        fn jobClass() -> string { let j = Json.tryParse(self.payload); return j == null ? "" : j.getString("displayName", j.getString("job", "")); }
+        fn failedMoment() -> Moment { return Moment.fromUnix(self.failedAt); }
+        fn toJson() -> string {
+            return "{\"id\":" + Json.quote(self.id) + ",\"uuid\":" + Json.quote(self.uuid) + ",\"connection\":" + Json.quote(self.connection) +
+                   ",\"queue\":" + Json.quote(self.queue) + ",\"payload\":" + Json.quote(self.payload) + ",\"exception\":" + Json.quote(self.exception) +
+                   ",\"failedAt\":${self.failedAt}}";
+        }
+        static fn fromJson(j: JsonValue) -> FailedJob {
+            return new FailedJob(j.getString("id", ""), j.getString("uuid", ""), j.getString("connection", ""), j.getString("queue", ""),
+                                 j.getString("payload", ""), j.getString("exception", ""), j.getLong("failedAt", 0));
+        }
+    }
+
+    interface FailedJobStore {
+        // Keeps a failure; its id (the job's uuid).
+        fn record(connection: string, queue: string, payload: string, exception: string) -> string
+        // Newest first.
+        fn all() -> Array<FailedJob>
+        fn find(id: string) -> FailedJob
+        fn forget(id: string) -> bool
+        // Removes all (or those older than `olderThanHours`); how many.
+        fn flush(olderThanHours: long = 0) -> long
+        fn count() -> long { return self.all().size() as long; }
+    }
+    // (the uuid inside a payload, which names the failure)
+    class FailedJobs {
+        static fn uuidOf(payload: string) -> string { let j = Json.tryParse(payload); let u = j == null ? "" : j.getString("uuid", ""); return u == "" ? Text.uuid() : u; }
+    }
+
+    class MemoryFailedJobStore implements FailedJobStore {
+        private jobs: Array<FailedJob>
+        private lock: Mutex
+        constructor() { self.jobs = new Array<FailedJob>(); self.lock = new Mutex(); }
+        fn record(connection: string, queue: string, payload: string, exception: string) -> string {
+            let uuid = FailedJobs.uuidOf(payload);
+            self.lock.lock();
+            self.jobs.insert(0, new FailedJob(uuid, uuid, connection, queue, payload, exception, Time.now()));
+            self.lock.unlock();
+            return uuid;
+        }
+        fn all() -> Array<FailedJob> { self.lock.lock(); let out = self.jobs.copy(); self.lock.unlock(); return out; }
+        fn find(id: string) -> FailedJob {
+            self.lock.lock();
+            let out: FailedJob = null;
+            for (j in self.jobs) { if (j.id == id) { out = j; break; } }
+            self.lock.unlock();
+            return out;
+        }
+        fn forget(id: string) -> bool {
+            self.lock.lock();
+            let before = self.jobs.size();
+            let kept = new Array<FailedJob>();
+            for (j in self.jobs) { if (j.id != id) { kept.push(j); } }
+            self.jobs = kept;
+            self.lock.unlock();
+            return kept.size() < before;
+        }
+        fn flush(olderThanHours: long = 0) -> long {
+            self.lock.lock();
+            let cutoff = Time.now() - olderThanHours * 3600;
+            let kept = new Array<FailedJob>();
+            for (j in self.jobs) { if (olderThanHours > 0 && j.failedAt > cutoff) { kept.push(j); } }
+            let n = self.jobs.size() - kept.size();
+            self.jobs = kept;
+            self.lock.unlock();
+            return n as long;
+        }
+    }
+
+    // One JSON line per failure, appended (rewritten on forget/flush).
+    class FileFailedJobStore implements FailedJobStore {
+        public path: string
+        private lock: Mutex
+        constructor(path: string) { self.path = path; self.lock = new Mutex(); }
+        fn record(connection: string, queue: string, payload: string, exception: string) -> string {
+            let uuid = FailedJobs.uuidOf(payload);
+            let line = new FailedJob(uuid, uuid, connection, queue, payload, exception, Time.now()).toJson() + "\n";
+            self.lock.lock();
+            try { new File(self.path).append(line); } finally { self.lock.unlock(); }
+            return uuid;
+        }
+        private fn readAll() -> Array<FailedJob> {
+            let out = new Array<FailedJob>();
+            let f = new File(self.path);
+            if (!f.exists()) { return out; }
+            for (line in Str.lines(f.read())) {
+                if (Str.trim(line) == "") { continue; }
+                let j = Json.tryParse(line);
+                if (j != null) { out.insert(0, FailedJob.fromJson(j)); }
+            }
+            return out;
+        }
+        private fn writeAll(jobs: Array<FailedJob>) {
+            let sb = new StringBuilder();
+            for (i in jobs.size() - 1..=0 step -1) { sb.append(jobs[i].toJson()).append("\n"); }
+            new File(self.path).write(sb.toString());
+        }
+        fn all() -> Array<FailedJob> { self.lock.lock(); try { return self.readAll(); } finally { self.lock.unlock(); } return new Array<FailedJob>(); }
+        fn find(id: string) -> FailedJob { for (j in self.all()) { if (j.id == id) { return j; } } return null; }
+        fn forget(id: string) -> bool {
+            self.lock.lock();
+            try {
+                let jobs = self.readAll();
+                let kept = new Array<FailedJob>();
+                for (j in jobs) { if (j.id != id) { kept.push(j); } }
+                if (kept.size() == jobs.size()) { return false; }
+                self.writeAll(kept);
+                return true;
+            } finally { self.lock.unlock(); }
+            return false;
+        }
+        fn flush(olderThanHours: long = 0) -> long {
+            self.lock.lock();
+            try {
+                let jobs = self.readAll();
+                let cutoff = Time.now() - olderThanHours * 3600;
+                let kept = new Array<FailedJob>();
+                for (j in jobs) { if (olderThanHours > 0 && j.failedAt > cutoff) { kept.push(j); } }
+                self.writeAll(kept);
+                return (jobs.size() - kept.size()) as long;
+            } finally { self.lock.unlock(); }
+            return 0;
+        }
+    }
+
+    // A failed_jobs table, through grav-db.
+    class DatabaseFailedJobStore implements FailedJobStore {
+        public table: string
+        private pool: Pool
+        constructor(pool: Pool, table: string = "failed_jobs") { self.pool = pool; self.table = table; }
+        fn createTable() {
+            let c = self.pool.acquire();
+            try {
+                let text = c.driver() == "mysql" ? "LONGTEXT" : "TEXT";
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (uuid VARCHAR(64) PRIMARY KEY, connection VARCHAR(255) NOT NULL, queue VARCHAR(255) NOT NULL, payload " +
+                       text + " NOT NULL, exception " + text + " NOT NULL, failed_at BIGINT NOT NULL)");
+            } finally { self.pool.release(c); }
+        }
+        fn record(connection: string, queue: string, payload: string, exception: string) -> string {
+            let uuid = FailedJobs.uuidOf(payload);
+            let c = self.pool.acquire();
+            try {
+                c.execute("DELETE FROM " + self.table + " WHERE uuid = ?", [uuid]);
+                c.execute("INSERT INTO " + self.table + " (uuid, connection, queue, payload, exception, failed_at) VALUES (?, ?, ?, ?, ?, ?)", [uuid, connection, queue, payload, exception, Time.now()]);
+            } finally { self.pool.release(c); }
+            return uuid;
+        }
+        private fn rows(sql: string, args: Array<any>) -> Array<FailedJob> {
+            let out = new Array<FailedJob>();
+            let c = self.pool.acquire();
+            try {
+                for (r in c.query(sql, args).toArray()) {
+                    let u = r.getString("uuid");
+                    out.push(new FailedJob(u, u, r.getString("connection"), r.getString("queue"), r.getString("payload"), r.getString("exception"), r.getInt("failed_at")));
+                }
+            } finally { self.pool.release(c); }
+            return out;
+        }
+        fn all() -> Array<FailedJob> { return self.rows("SELECT * FROM " + self.table + " ORDER BY failed_at DESC", new Array<any>()); }
+        fn find(id: string) -> FailedJob { let r = self.rows("SELECT * FROM " + self.table + " WHERE uuid = ?", [id as any]); return r.size() > 0 ? r[0] : null; }
+        fn forget(id: string) -> bool {
+            let c = self.pool.acquire();
+            try { return c.execute("DELETE FROM " + self.table + " WHERE uuid = ?", [id]) > 0; } finally { self.pool.release(c); }
+            return false;
+        }
+        fn flush(olderThanHours: long = 0) -> long {
+            let c = self.pool.acquire();
+            try {
+                if (olderThanHours > 0) { return c.execute("DELETE FROM " + self.table + " WHERE failed_at <= ?", [Time.now() - olderThanHours * 3600]); }
+                return c.execute("DELETE FROM " + self.table);
+            } finally { self.pool.release(c); }
+            return 0;
+        }
+        fn count() -> long {
+            let c = self.pool.acquire();
+            try { return Integer.parseOr(str(c.queryValue("SELECT COUNT(*) FROM " + self.table)), 0); } finally { self.pool.release(c); }
+            return 0;
+        }
+    }
+}
