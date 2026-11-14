@@ -74,6 +74,7 @@ namespace apogee {
             self.tasks = new Channel<fn()>(1);
             let tasks = self.tasks;
             self.thread = Thread.spawn("queue-runner", fn() {
+                Worker.threadStarting();
                 while (tasks.hasNext()) { let t = tasks.receive(); t(); }
             });
         }
@@ -99,6 +100,10 @@ namespace apogee {
         private startedAt: long = 0
 
         static restartKey: string = "apogee:queue:restart"
+        // Runs at the start of every thread that runs jobs (a worker's, the timeout
+        // runner's): what a thread needs of its own, such as a database connection.
+        static onThreadStart: fn() = null
+        static fn threadStarting() { let f = Worker.onThreadStart; if (f != null) { f(); } }
 
         constructor(manager: QueueManager) { self.manager = manager; self.stats = new WorkerStats(); }
 
@@ -113,6 +118,7 @@ namespace apogee {
             self.startedAt = Time.nowMs();
             self.shouldQuit = false;
             self.exitCode = 0;
+            Worker.threadStarting();
             if (options.trapSignals) { Process.trapSignals([Process.SIGTERM(), Process.SIGINT(), Process.SIGQUIT(), Process.SIGUSR2(), 18]); }
             let restartAtStart = self.restartStamp();
             let jobs = 0;

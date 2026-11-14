@@ -158,6 +158,7 @@ For each job, the worker:
 
 The loop stops on any of these:
 
+- **Threads:** `Worker.onThreadStart` runs at the start of every thread that runs jobs (each `workConcurrently` worker, the timeout runner), for what a thread needs of its own, such as a database connection.
 - **Signals:** SIGTERM, SIGINT or SIGQUIT, after the job in hand. SIGUSR2
   pauses the worker and SIGCONT resumes it.
 - **`queue:restart`.**
