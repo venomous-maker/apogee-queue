@@ -1,0 +1,117 @@
+// database_driver.grav — jobs in a table (SQLite, MySQL/MariaDB or
+// PostgreSQL through grav-db), for apps that have a database and no Redis.
+//
+//   let jobs = new DatabaseQueueDriver(new Pool(4, fn() -> Connection { return Sqlite.open("app.db") }))
+//   jobs.createTable()
+//   queue.addConnection("database", jobs)
+//
+// A worker claims a job with an UPDATE that only succeeds while the job is
+// still unreserved (or its reservation lapsed): two workers never get the same
+// job, on any database, without row locks.
+import "std"
+import "grav-db"
+import "drivers.grav"
+
+namespace apogee {
+
+    class DatabaseQueueDriver implements QueueDriver {
+        public table: string
+        private pool: Pool
+
+        constructor(pool: Pool, table: string = "jobs") { self.pool = pool; self.table = table; }
+        fn name() -> string { return "database"; }
+
+        // Makes the table (and its index) if it is not there.
+        fn createTable() {
+            let c = self.pool.acquire();
+            try {
+                let d = c.driver();
+                let id = d == "postgres" ? "BIGSERIAL PRIMARY KEY" : (d == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT");
+                let text = d == "mysql" ? "LONGTEXT" : "TEXT";
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (id " + id + ", queue VARCHAR(255) NOT NULL, payload " + text +
+                       " NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, reserved_at BIGINT NULL, available_at BIGINT NOT NULL, created_at BIGINT NOT NULL)");
+                if (d == "mysql") {
+                    let has = c.queryValue("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?", [self.table, self.table + "_queue_index"]);
+                    if (Integer.parseOr(str(has), 0) == 0) { c.exec("CREATE INDEX " + self.table + "_queue_index ON " + self.table + " (queue, available_at)"); }
+                } else {
+                    c.exec("CREATE INDEX IF NOT EXISTS " + self.table + "_queue_index ON " + self.table + " (queue, available_at)");
+                }
+            } finally { self.pool.release(c); }
+        }
+
+        fn push(queue: string, payload: string, delaySeconds: long) -> string {
+            let now = Time.now();
+            let c = self.pool.acquire();
+            let id = 0 as long;
+            try {
+                if (c.driver() == "postgres") {
+                    id = Integer.parseOr(str(c.queryValue("INSERT INTO " + self.table + " (queue, payload, attempts, available_at, created_at) VALUES (?, ?, 0, ?, ?) RETURNING id", [queue, payload, now + delaySeconds, now])), 0);
+                } else {
+                    id = c.insert("INSERT INTO " + self.table + " (queue, payload, attempts, available_at, created_at) VALUES (?, ?, 0, ?, ?)", [queue, payload, now + delaySeconds, now]);
+                }
+            } finally { self.pool.release(c); }
+            return "${id}";
+        }
+        // Every INSERT in one transaction (one commit, one fsync).
+        fn pushMany(queue: string, payloads: Array<string>, delaySeconds: long) -> Array<string> {
+            let ids = new Array<string>();
+            if (payloads.size() == 0) { return ids; }
+            let now = Time.now();
+            let table = self.table;
+            let c = self.pool.acquire();
+            try {
+                c.transaction(fn() {
+                    for (p in payloads) {
+                        let id = c.driver() == "postgres"
+                            ? Integer.parseOr(str(c.queryValue("INSERT INTO " + table + " (queue, payload, attempts, available_at, created_at) VALUES (?, ?, 0, ?, ?) RETURNING id", [queue, p, now + delaySeconds, now])), 0)
+                            : c.insert("INSERT INTO " + table + " (queue, payload, attempts, available_at, created_at) VALUES (?, ?, 0, ?, ?)", [queue, p, now + delaySeconds, now]);
+                        ids.push("${id}");
+                    }
+                });
+            } finally { self.pool.release(c); }
+            return ids;
+        }
+        fn pop(queue: string, retryAfter: long) -> ReservedJob {
+            let c = self.pool.acquire();
+            try {
+                // (a few tries: another worker may claim the row we picked first)
+                for (attempt in 0..5) {
+                    let now = Time.now();
+                    let lapsed = now - (retryAfter > 0 ? retryAfter : 90);
+                    let row = c.queryOne("SELECT id, payload, attempts, reserved_at FROM " + self.table +
+                        " WHERE queue = ? AND ((reserved_at IS NULL AND available_at <= ?) OR reserved_at <= ?) ORDER BY id LIMIT 1", [queue, now, lapsed]);
+                    if (row == null) { return null; }
+                    let id = row.getInt("id");
+                    let claimed = row.isNull("reserved_at")
+                        ? c.execute("UPDATE " + self.table + " SET reserved_at = ?, attempts = attempts + 1 WHERE id = ? AND reserved_at IS NULL", [now, id])
+                        : c.execute("UPDATE " + self.table + " SET reserved_at = ?, attempts = attempts + 1 WHERE id = ? AND reserved_at = ?", [now, id, row.getInt("reserved_at")]);
+                    if (claimed == 1) { return new ReservedJob("${id}", queue, row.getString("payload"), (row.getInt("attempts") + 1) as int); }
+                }
+                return null;
+            } finally { self.pool.release(c); }
+            return null;
+        }
+        fn delete(job: ReservedJob) {
+            let c = self.pool.acquire();
+            try { c.execute("DELETE FROM " + self.table + " WHERE id = ?", [Integer.parseOr(job.id, 0)]); } finally { self.pool.release(c); }
+        }
+        fn release(job: ReservedJob, delaySeconds: long) {
+            let c = self.pool.acquire();
+            try { c.execute("UPDATE " + self.table + " SET reserved_at = NULL, available_at = ? WHERE id = ?", [Time.now() + delaySeconds, Integer.parseOr(job.id, 0)]); }
+            finally { self.pool.release(c); }
+        }
+        private fn count(sql: string, args: Array<any>) -> long {
+            let c = self.pool.acquire();
+            try { return Integer.parseOr(str(c.queryValue(sql, args)), 0); } finally { self.pool.release(c); }
+            return 0;
+        }
+        fn size(queue: string) -> long { return self.count("SELECT COUNT(*) FROM " + self.table + " WHERE queue = ? AND reserved_at IS NULL AND available_at <= ?", [queue, Time.now()]); }
+        fn delayedSize(queue: string) -> long { return self.count("SELECT COUNT(*) FROM " + self.table + " WHERE queue = ? AND reserved_at IS NULL AND available_at > ?", [queue, Time.now()]); }
+        fn reservedSize(queue: string) -> long { return self.count("SELECT COUNT(*) FROM " + self.table + " WHERE queue = ? AND reserved_at IS NOT NULL", [queue]); }
+        fn clear(queue: string) -> long {
+            let c = self.pool.acquire();
+            try { return c.execute("DELETE FROM " + self.table + " WHERE queue = ?", [queue]); } finally { self.pool.release(c); }
+            return 0;
+        }
+    }
+}

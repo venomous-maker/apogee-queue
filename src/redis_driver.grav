@@ -1,0 +1,132 @@
+// redis_driver.grav — jobs in Redis, shared by every worker on every machine.
+//
+//   queue.addConnection("redis", RedisQueueDriver.open("redis://127.0.0.1:6379/0"))
+//
+// The layout is Laravel's: a list of ready jobs (queues:<name>), a sorted set
+// of delayed ones (:delayed, by when they are due) and one of reserved ones
+// (:reserved, by when the reservation lapses). One Lua script per pop moves due
+// and lapsed jobs back to the list and reserves the next, atomically, in one
+// round trip. Each entry is "<attempts>|<id>|<payload>": the script counts the
+// attempt without decoding (or re-encoding) the payload.
+import "std"
+import "grav-redis"
+import "drivers.grav"
+
+namespace apogee {
+
+    class RedisQueueDriver implements QueueDriver {
+        public prefix: string
+        // Seconds pop() waits on an empty queue (BLPOP) before giving up; 0: does not wait.
+        public blockFor: long = 0
+        private pool: RedisPool
+        private popSha: string = ""
+        private releaseSha: string = ""
+        private shaLock: Mutex
+
+        static popScript: string = "local now = tonumber(ARGV[1])\nfor _, from in ipairs({KEYS[2], KEYS[3]}) do\n  local due = redis.call('zrangebyscore', from, '-inf', now, 'limit', 0, 100)\n  if #due > 0 then\n    redis.call('zremrangebyrank', from, 0, #due - 1)\n    for i = 1, #due, 100 do redis.call('rpush', KEYS[1], unpack(due, i, math.min(i + 99, #due))) end\n  end\nend\nlocal job = redis.call('lpop', KEYS[1])\nif not job then return false end\nlocal bar = string.find(job, '|', 1, true)\nlocal reserved = tostring(tonumber(string.sub(job, 1, bar - 1)) + 1) .. string.sub(job, bar)\nredis.call('zadd', KEYS[3], ARGV[2], reserved)\nreturn reserved"
+        static releaseScript: string = "redis.call('zrem', KEYS[1], ARGV[1])\nredis.call('zadd', KEYS[2], ARGV[2], ARGV[1])\nreturn 1"
+
+        constructor(pool: RedisPool, prefix: string = "queues:") { self.pool = pool; self.prefix = prefix; self.shaLock = new Mutex(); }
+        // A driver with its own pool of `connections` connections to `url`.
+        static fn open(url: string, connections: int = 8, prefix: string = "queues:") -> RedisQueueDriver {
+            return new RedisQueueDriver(new RedisPool(connections, fn() -> RedisConnection { return RedisConnection.open(url); }), prefix);
+        }
+        fn name() -> string { return "redis"; }
+        fn needsSleep() -> bool { return self.blockFor <= 0; }
+        private fn key(queue: string) -> string { return self.prefix + queue; }
+
+        fn push(queue: string, payload: string, delaySeconds: long) -> string {
+            let id = Text.random(20);
+            let entry = "0|" + id + "|" + payload;
+            let c = self.pool.acquire();
+            try {
+                if (delaySeconds > 0) { c.zAdd(self.key(queue) + ":delayed", ((Time.now() + delaySeconds) as double), entry); }
+                else { c.rPush(self.key(queue), entry); }
+            } finally { self.pool.release(c); }
+            return id;
+        }
+        // One RPUSH (or one pipelined ZADD per job) for all of them.
+        fn pushMany(queue: string, payloads: Array<string>, delaySeconds: long) -> Array<string> {
+            let ids = new Array<string>();
+            let entries = new Array<any>();
+            for (p in payloads) { let id = Text.random(20); ids.push(id); entries.push("0|" + id + "|" + p); }
+            if (entries.size() == 0) { return ids; }
+            let c = self.pool.acquire();
+            try {
+                if (delaySeconds > 0) {
+                    let due = (Time.now() + delaySeconds) as double;
+                    let k = self.key(queue) + ":delayed";
+                    c.pipeline(fn(p: RedisPipeline) { for (e in entries) { p.command("ZADD", [k, due, e]); } });
+                } else { c.rPush(self.key(queue), entries); }
+            } finally { self.pool.release(c); }
+            return ids;
+        }
+        fn pop(queue: string, retryAfter: long) -> ReservedJob {
+            let k = self.key(queue);
+            let now = Time.now();
+            let until = now + (retryAfter > 0 ? retryAfter : 90);
+            let c = self.pool.acquire();
+            let r: any = null;
+            try {
+                r = self.runScript(c, true, [k, k + ":delayed", k + ":reserved"], ["${now}", "${until}"]);
+                if (r == null && self.blockFor > 0) {
+                    // (nothing ready: wait for a push, then reserve what came)
+                    let got = c.blPop([k], self.blockFor);
+                    if (got != null && got.size() == 2) {
+                        let job = got[1];
+                        let bar = Str.indexOf(job, "|");
+                        let reserved = "${Integer.parseOr(job[..bar], 0) + 1}" + job[bar..];
+                        c.zAdd(k + ":reserved", (Time.now() + (retryAfter > 0 ? retryAfter : 90)) as double, reserved);
+                        r = reserved;
+                    }
+                }
+            } finally { self.pool.release(c); }
+            if (r == null) { return null; }
+            let entry = r as string;
+            let a = Str.indexOf(entry, "|");
+            let b = Str.indexFrom(entry, "|", a + 1);
+            let job = new ReservedJob(entry[a + 1..b], queue, entry[b + 1..], Integer.parseOr(entry[..a], 1) as int);
+            job.handle = entry;
+            return job;
+        }
+        fn delete(job: ReservedJob) {
+            let c = self.pool.acquire();
+            try { c.zRem(self.key(job.queue) + ":reserved", [job.handle as any]); } finally { self.pool.release(c); }
+        }
+        fn release(job: ReservedJob, delaySeconds: long) {
+            let k = self.key(job.queue);
+            let c = self.pool.acquire();
+            try { self.runScript(c, false, [k + ":reserved", k + ":delayed"], [job.handle, "${Time.now() + delaySeconds}"]); }
+            finally { self.pool.release(c); }
+        }
+        // EVALSHA, loading the script the first time (and again after a SCRIPT FLUSH).
+        private fn runScript(c: RedisConnection, pop: bool, keys: Array<string>, args: Array<any>) -> any {
+            let script = pop ? RedisQueueDriver.popScript : RedisQueueDriver.releaseScript;
+            self.shaLock.lock();
+            let sha = pop ? self.popSha : self.releaseSha;
+            self.shaLock.unlock();
+            if (sha != "") {
+                try { return c.evalSha(sha, keys, args); }
+                catch (e: Exception) { if (!Str.contains(e.message(), "NOSCRIPT")) { throw e; } }
+            }
+            let loaded = c.scriptLoad(script);
+            self.shaLock.lock();
+            if (pop) { self.popSha = loaded; } else { self.releaseSha = loaded; }
+            self.shaLock.unlock();
+            return c.evalSha(loaded, keys, args);
+        }
+        fn size(queue: string) -> long { let c = self.pool.acquire(); try { return c.lLen(self.key(queue)); } finally { self.pool.release(c); } return 0; }
+        fn delayedSize(queue: string) -> long { let c = self.pool.acquire(); try { return c.zCard(self.key(queue) + ":delayed"); } finally { self.pool.release(c); } return 0; }
+        fn reservedSize(queue: string) -> long { let c = self.pool.acquire(); try { return c.zCard(self.key(queue) + ":reserved"); } finally { self.pool.release(c); } return 0; }
+        fn clear(queue: string) -> long {
+            let k = self.key(queue);
+            let c = self.pool.acquire();
+            try {
+                let n = c.lLen(k) + c.zCard(k + ":delayed") + c.zCard(k + ":reserved");
+                c.del([k, k + ":delayed", k + ":reserved"]);
+                return n;
+            } finally { self.pool.release(c); }
+            return 0;
+        }
+    }
+}

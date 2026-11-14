@@ -1,0 +1,171 @@
+// drivers.grav — where queued jobs wait: the QueueDriver interface, and the
+// memory, sync and null drivers (Redis and database drivers are in their
+// own files).
+//
+// A worker pops a job, which reserves it for `retryAfter` seconds: if the
+// worker dies before deleting or releasing it, it comes back on the queue
+// when the reservation lapses, so no job is lost to a crash.
+import "std"
+import "apogee-support"
+
+namespace apogee {
+
+    // A job taken off a queue: yours to delete (done) or release (again later).
+    class ReservedJob {
+        public id: string
+        public queue: string
+        public payload: string
+        // Which attempt this is, counting this one.
+        public attempts: int
+        // What the driver needs to find it again (Redis: the reserved entry).
+        public handle: string = ""
+        constructor(id: string, queue: string, payload: string, attempts: int) { self.id = id; self.queue = queue; self.payload = payload; self.attempts = attempts; }
+    }
+
+    interface QueueDriver {
+        // "memory", "redis", "database", "sync", "null".
+        fn name() -> string
+        // Adds a payload to `queue`, to run after `delaySeconds`; its id.
+        fn push(queue: string, payload: string, delaySeconds: long) -> string
+        // Adds several at once (a driver that can do it in one round trip overrides it).
+        fn pushMany(queue: string, payloads: Array<string>, delaySeconds: long) -> Array<string> {
+            let ids = new Array<string>();
+            for (p in payloads) { ids.push(self.push(queue, p, delaySeconds)); }
+            return ids;
+        }
+        // The next job that is due, reserved for `retryAfter` seconds; null when none.
+        fn pop(queue: string, retryAfter: long) -> ReservedJob
+        // Done with it: gone from the queue.
+        fn delete(job: ReservedJob)
+        // Back on the queue, due after `delaySeconds` (its attempts kept).
+        fn release(job: ReservedJob, delaySeconds: long)
+        // Jobs that are due now / waiting for their delay / reserved by a worker.
+        fn size(queue: string) -> long
+        fn delayedSize(queue: string) -> long { return 0; }
+        fn reservedSize(queue: string) -> long { return 0; }
+        // Removes every job on `queue` (reserved ones too); how many.
+        fn clear(queue: string) -> long
+        // Whether a worker sleeping between polls is needed (false when pop() blocks by itself).
+        fn needsSleep() -> bool { return true; }
+    }
+
+    class MemoryEntry {
+        public id: string
+        public payload: string
+        public attempts: int
+        public availableAt: long          // unix ms
+        public reservedUntil: long = 0    // unix ms
+        constructor(id: string, payload: string, attempts: int, availableAt: long) { self.id = id; self.payload = payload; self.attempts = attempts; self.availableAt = availableAt; }
+    }
+    class MemoryQueueLane {
+        public ready: Deque<MemoryEntry>
+        public delayed: Array<MemoryEntry>
+        public reserved: HashMap<string, MemoryEntry>
+        constructor() { self.ready = new Deque<MemoryEntry>(); self.delayed = new Array<MemoryEntry>(); self.reserved = new HashMap<string, MemoryEntry>(); }
+    }
+
+    // Jobs in this process's memory: tests, and one-process apps whose workers
+    // are threads. Thread-safe; gone when the process exits.
+    class MemoryQueueDriver implements QueueDriver {
+        private lanes: HashMap<string, MemoryQueueLane>
+        private lock: Mutex
+        private counter: AtomicInt
+        constructor() { self.lanes = new HashMap<string, MemoryQueueLane>(); self.lock = new Mutex(); self.counter = new AtomicInt(0); }
+        fn name() -> string { return "memory"; }
+        private fn lane(queue: string) -> MemoryQueueLane {
+            let l = self.lanes.getOr(queue, null);
+            if (l == null) { l = new MemoryQueueLane(); self.lanes.put(queue, l); }
+            return l;
+        }
+        fn push(queue: string, payload: string, delaySeconds: long) -> string {
+            let id = "${self.counter.increment()}";
+            let now = Time.nowMs();
+            let e = new MemoryEntry(id, payload, 0, now + delaySeconds * 1000);
+            self.lock.lock();
+            let l = self.lane(queue);
+            if (delaySeconds > 0) { MemoryQueueDriver.insertDelayed(l, e); } else { l.ready.pushBack(e); }
+            self.lock.unlock();
+            return id;
+        }
+        // (kept in due order, so moving due ones is a scan from the front)
+        private static fn insertDelayed(l: MemoryQueueLane, e: MemoryEntry) {
+            let i = l.delayed.size();
+            while (i > 0 && l.delayed[i - 1].availableAt > e.availableAt) { i -= 1; }
+            l.delayed.insert(i, e);
+        }
+        fn pop(queue: string, retryAfter: long) -> ReservedJob {
+            let now = Time.nowMs();
+            self.lock.lock();
+            let l = self.lane(queue);
+            // due delayed jobs, then lapsed reservations, back to ready
+            let due = 0;
+            while (due < l.delayed.size() && l.delayed[due].availableAt <= now) { l.ready.pushBack(l.delayed[due]); due += 1; }
+            if (due > 0) { l.delayed = l.delayed.slice(due, l.delayed.size()); }
+            if (l.reserved.size() > 0) {
+                let lapsed = new Array<string>();
+                l.reserved.forEach(fn(id: string, e: MemoryEntry) { if (e.reservedUntil <= now) { lapsed.push(id); } });
+                for (id in lapsed) { let e = l.reserved[id]; l.reserved.remove(id); e.reservedUntil = 0; l.ready.pushBack(e); }
+            }
+            if (l.ready.isEmpty()) { self.lock.unlock(); return null; }
+            let e = l.ready.popFront();
+            e.attempts += 1;
+            e.reservedUntil = now + (retryAfter > 0 ? retryAfter : 90) * 1000;
+            l.reserved.put(e.id, e);
+            self.lock.unlock();
+            return new ReservedJob(e.id, queue, e.payload, e.attempts);
+        }
+        fn delete(job: ReservedJob) {
+            self.lock.lock();
+            self.lane(job.queue).reserved.remove(job.id);
+            self.lock.unlock();
+        }
+        fn release(job: ReservedJob, delaySeconds: long) {
+            self.lock.lock();
+            let l = self.lane(job.queue);
+            let e = l.reserved.getOr(job.id, null);
+            if (e != null) {
+                l.reserved.remove(job.id);
+                e.reservedUntil = 0;
+                e.availableAt = Time.nowMs() + delaySeconds * 1000;
+                if (delaySeconds > 0) { MemoryQueueDriver.insertDelayed(l, e); } else { l.ready.pushBack(e); }
+            }
+            self.lock.unlock();
+        }
+        fn size(queue: string) -> long { self.lock.lock(); let n = self.lane(queue).ready.size(); self.lock.unlock(); return n as long; }
+        fn delayedSize(queue: string) -> long { self.lock.lock(); let n = self.lane(queue).delayed.size(); self.lock.unlock(); return n as long; }
+        fn reservedSize(queue: string) -> long { self.lock.lock(); let n = self.lane(queue).reserved.size(); self.lock.unlock(); return n as long; }
+        fn clear(queue: string) -> long {
+            self.lock.lock();
+            let l = self.lane(queue);
+            let n = l.ready.size() + l.delayed.size() + l.reserved.size();
+            self.lanes.put(queue, new MemoryQueueLane());
+            self.lock.unlock();
+            return n as long;
+        }
+    }
+
+    // Runs every job at once, in the dispatching thread (QueueManager sees the
+    // name and runs it instead of pushing): local development, tests.
+    class SyncQueueDriver implements QueueDriver {
+        constructor() {}
+        fn name() -> string { return "sync"; }
+        fn push(queue: string, payload: string, delaySeconds: long) -> string { throw new StateError("the sync driver runs jobs when they are dispatched"); }
+        fn pop(queue: string, retryAfter: long) -> ReservedJob { return null; }
+        fn delete(job: ReservedJob) {}
+        fn release(job: ReservedJob, delaySeconds: long) {}
+        fn size(queue: string) -> long { return 0; }
+        fn clear(queue: string) -> long { return 0; }
+    }
+
+    // Drops every job (a queue switched off).
+    class NullQueueDriver implements QueueDriver {
+        constructor() {}
+        fn name() -> string { return "null"; }
+        fn push(queue: string, payload: string, delaySeconds: long) -> string { return ""; }
+        fn pop(queue: string, retryAfter: long) -> ReservedJob { return null; }
+        fn delete(job: ReservedJob) {}
+        fn release(job: ReservedJob, delaySeconds: long) {}
+        fn size(queue: string) -> long { return 0; }
+        fn clear(queue: string) -> long { return 0; }
+    }
+}
