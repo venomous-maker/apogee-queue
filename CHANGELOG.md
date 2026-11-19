@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-19)
+
 The first tagged release. Needs grav 1.7.0 or newer.
 
 Queues for [Apogee](https://github.com/venomous-maker): jobs that run later, on workers.
