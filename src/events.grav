@@ -11,6 +11,10 @@ namespace apogee {
         // The job's display name (its class).
         public job: string = ""
         public jobId: string = ""
+        // The job's payload as queued (JobCodec's JSON: its data, tags, tries, ...), "" for a sync job.
+        public payload: string = ""
+        // This event with `payload` set (for firing in one expression).
+        fn carrying(payload: string) -> QueueJobEvent { self.payload = payload; return self; }
     }
     class JobQueued extends QueueJobEvent {
         constructor(connection: string, queue: string, job: string, jobId: string) { self.connection = connection; self.queue = queue; self.job = job; self.jobId = jobId; }
