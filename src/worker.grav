@@ -100,6 +100,8 @@ namespace apogee {
         private startedAt: long = 0
 
         static restartKey: string = "apogee:queue:restart"
+        // While set in the shared cache, workers run no jobs (queue:pause / the dashboard).
+        static pauseKey: string = "apogee:queue:paused"
         // Runs at the start of every thread that runs jobs (a worker's, the timeout
         // runner's): what a thread needs of its own, such as a database connection.
         static onThreadStart: fn() = null
@@ -109,6 +111,11 @@ namespace apogee {
 
         // Tells every worker sharing the manager's cache to stop after its current job (queue:restart).
         static fn signalRestart(cache: CacheRepository) { cache.forever(Worker.restartKey, Time.nowMs()); }
+        // Pauses every worker sharing the cache (they finish their current job, then wait).
+        static fn signalPause(cache: CacheRepository) { cache.forever(Worker.pauseKey, true); }
+        // Lets them run jobs again.
+        static fn signalContinue(cache: CacheRepository) { cache.forget(Worker.pauseKey); }
+        static fn isPausedIn(cache: CacheRepository) -> bool { return cache != null && cache.has(Worker.pauseKey); }
 
         // ── the loop ───────────────────────────────────────────────────────────
         // Works until told to stop; the exit code (0: fine, 12: too much memory, 1: a job timed out).
@@ -123,9 +130,17 @@ namespace apogee {
             let restartAtStart = self.restartStamp();
             let jobs = 0;
             self.manager.fire(new WorkerStarting(options.name, conn, Str.join(qs, ",")));
+            let pauseCheckedAt: long = 0;
+            let cachePaused = false;
             while (!self.shouldQuit) {
                 if (options.trapSignals) { self.readSignals(); }
-                if (self.paused) { Time.sleepMs(200); continue; }
+                // (the shared pause flag, read at most once a second)
+                if (Time.monotonicMs() - pauseCheckedAt >= 1000) {
+                    pauseCheckedAt = Time.monotonicMs();
+                    try { cachePaused = Worker.isPausedIn(self.manager.cache); } catch (e: Exception) { cachePaused = false; }
+                    if (cachePaused && self.restartStamp() != restartAtStart) { break; }
+                }
+                if (self.paused || cachePaused) { Time.sleepMs(200); continue; }
                 let ran = self.runNextJob(conn, qs, options);
                 if (ran) { jobs += 1; }
                 if (self.stopReason(options, jobs, restartAtStart, ran) != "") { break; }
@@ -211,7 +226,7 @@ namespace apogee {
             }
             let name = p.displayName;
             let maxTries = p.maxTries > 0 ? p.maxTries : options.tries;
-            self.manager.fire(new JobProcessing(connection, reserved.queue, name, reserved.id, reserved.attempts));
+            self.manager.fire(new JobProcessing(connection, reserved.queue, name, reserved.id, reserved.attempts).carrying(reserved.payload));
             if (maxTries > 0 && reserved.attempts > maxTries) {
                 self.failJob(connection, driver, reserved, p, null, new MaxAttemptsExceededException(name + " has been attempted too many times (${maxTries})"));
                 return;
@@ -268,14 +283,14 @@ namespace apogee {
             if (state.released) {
                 driver.release(reserved, state.releaseDelay);
                 self.stats.released += 1;
-                self.manager.fire(new JobReleased(connection, reserved.queue, name, reserved.id, state.releaseDelay));
+                self.manager.fire(new JobReleased(connection, reserved.queue, name, reserved.id, state.releaseDelay).carrying(reserved.payload));
                 return;
             }
             driver.delete(reserved);
             self.record(name, ms);
             self.stats.processed += 1;
             if (!state.deleted) {
-                self.manager.fire(new JobProcessed(connection, reserved.queue, name, reserved.id, ms));
+                self.manager.fire(new JobProcessed(connection, reserved.queue, name, reserved.id, ms).carrying(reserved.payload));
                 self.nextInChain(p);
             }
             if (p.maxExceptions > 0) { self.manager.cache.forget("job-exceptions:" + p.uuid); }
@@ -316,7 +331,7 @@ namespace apogee {
             }
             driver.release(reserved, delay);
             self.stats.released += 1;
-            self.manager.fire(new JobReleased(connection, reserved.queue, p.displayName, reserved.id, delay));
+            self.manager.fire(new JobReleased(connection, reserved.queue, p.displayName, reserved.id, delay).carrying(reserved.payload));
         }
         private fn failJob(connection: string, driver: QueueDriver, reserved: ReservedJob, p: Payload, job: Job, e: Exception) {
             driver.delete(reserved);
@@ -326,7 +341,7 @@ namespace apogee {
                 try { job.failed(e); } catch (x: Exception) {}
                 if (job.uniqueId() != "") { self.manager.cache.forget(QueueManager.uniqueKey(job)); }
             }
-            self.manager.fire(new JobFailed(connection, reserved.queue, p.displayName, reserved.id, e));
+            self.manager.fire(new JobFailed(connection, reserved.queue, p.displayName, reserved.id, e).carrying(reserved.payload));
             if (p.chainCatch != "") { self.manager.pushRaw(p.chainCatch); }
             self.finishedOne(p, true);
         }
