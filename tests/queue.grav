@@ -428,3 +428,43 @@ test "the worker stops on maxJobs, and on queue:restart" {
     t.join()
     assertEq(Trace.counter.get(), 5)
 }
+
+class Tagged extends Job {
+    public orderId: int = 0
+    constructor(orderId: int = 0) { self.orderId = orderId }
+    fn tags() -> Array<string> { return ["order:" + str(self.orderId)] }
+    fn handle() {}
+}
+
+test "job events carry the payload (data, tags and all)" {
+    let q = manager()
+    let events = new Events(q.container)
+    q.events = events
+    let seen = new Array<string>()
+    events.listen::<QueueJobEvent>(fn(e: QueueJobEvent) { seen.push(typename(e) + "|" + e.jobId + "|" + e.payload) })
+    q.dispatch(new Tagged(42))
+    q.bulk([new Tagged(1), new Tagged(2)] as Array<Job>)
+    drain(q)
+    let queued = seen.filter(fn(s: string) => Str.contains(s, "\"order:42\""))
+    assert(queued.size() >= 3)                        // queued, processing, processed
+    for (s in seen) {
+        assert(Str.contains(s, "\"tags\":[\"order:"))
+        assert(Str.split(s, "|")[1] != "")            // bulk jobs have their ids too
+    }
+}
+
+test "workers sharing a cache pause and continue together" {
+    let q = manager()
+    Worker.signalPause(q.cache)
+    assert(Worker.isPausedIn(q.cache))
+    for (i in 0..3) { q.dispatch(new Counted()) }
+    let o = quiet()
+    let t = Thread.spawn(fn() { q.worker().work("memory", ["default"], o) })
+    Time.sleepMs(1500)
+    assertEq(Trace.counter.get(), 0)                  // paused: nothing ran
+    Worker.signalContinue(q.cache)
+    Time.sleepMs(1500)
+    assertEq(Trace.counter.get(), 3)
+    Worker.signalRestart(q.cache)
+    t.join()
+}
