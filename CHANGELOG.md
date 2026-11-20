@@ -6,6 +6,15 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Added
+
+- Job events (`JobQueued`, `JobProcessing`, `JobProcessed`, `JobReleased`,
+  `JobFailed`) carry the job's `payload` (its data, tags, tries, pushed time),
+  for dashboards and monitoring; `JobQueued` from `bulk()` has the job's id.
+- Workers sharing a cache can be paused and continued together:
+  `Worker.signalPause(cache)`, `Worker.signalContinue(cache)`,
+  `Worker.isPausedIn(cache)` (checked about once a second).
+
 ## 0.2.1 (2026-11-20)
 
 ### Requirements
