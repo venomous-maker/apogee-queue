@@ -127,7 +127,7 @@ namespace apogee {
             let payloads = new Array<string>();
             for (j in jobs) { j.queueName = q; j.connectionName = conn; payloads.push(JobCodec.encode(j)); }
             let ids = self.connection(conn).pushMany(q, payloads, jobs[0].delaySeconds);
-            for (j in jobs) { self.fire(new JobQueued(conn, q, j.displayName(), "")); }
+            for (i, j in jobs) { self.fire(new JobQueued(conn, q, j.displayName(), i < ids.size() ? ids[i] : "").carrying(payloads[i])); }
             return ids;
         }
         // A chain: each job runs after the one before it succeeds.
@@ -177,7 +177,7 @@ namespace apogee {
             let catchPayload = catchJob == null ? "" : JobCodec.encode(catchJob);
             let payload = JobCodec.encode(job, chainPayloads, catchPayload, batchId);
             let id = driver.push(q, payload, job.delaySeconds);
-            self.fire(new JobQueued(conn, q, job.displayName(), id));
+            self.fire(new JobQueued(conn, q, job.displayName(), id).carrying(payload));
             return id;
         }
         // Pushes an already-encoded payload (retrying a failed job, a chain's next link).
