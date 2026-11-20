@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.3.0 (2026-11-20)
+
 ### Added
 
 - Job events (`JobQueued`, `JobProcessing`, `JobProcessed`, `JobReleased`,
