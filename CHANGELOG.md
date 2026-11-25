@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Dependencies
+
+- Uses grav-cache 0.2.2 (from their GitHub tags).
+
 ## 0.3.0 (2026-11-20)
 
 ### Added

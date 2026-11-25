@@ -7,6 +7,6 @@ paths = ["src"]
 apogee-support = "github.com/venomous-maker/apogee-support@v0.2.0"
 apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
 apogee-events = "github.com/venomous-maker/apogee-events@v0.2.0"
-grav-cache = "github.com/venomous-maker/grav-cache@v0.2.1"
+grav-cache = "github.com/venomous-maker/grav-cache@v0.2.2"
 grav-redis = "github.com/venomous-maker/grav-redis@v0.2.1"
 grav-db = "github.com/venomous-maker/grav-db@v0.2.0"
