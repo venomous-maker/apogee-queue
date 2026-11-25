@@ -9,7 +9,7 @@ on workers.
 - **Around the jobs:** queued event listeners, failed-job storage, and a fake
   for tests.
 
-```grav
+```typescript
 import "std"
 import "apogee-queue"
 
@@ -81,7 +81,7 @@ set. Fields marked `@Transient` stay behind.
 
 ## Dispatching
 
-```grav
+```typescript
 queue.dispatch(job)                       // its id ("" when a unique job with its key is already queued)
 queue.dispatchSync(job)                   // now, in this thread
 queue.dispatchIf(cond, job)  queue.dispatchUnless(cond, job)  queue.later(30, job)
@@ -130,7 +130,7 @@ too.
 
 ## Workers
 
-```grav
+```typescript
 let o = new WorkerOptions()
 o.tries = 3; o.timeout = 60; o.backoff = [5, 30]; o.sleep = 1.0
 o.maxJobs = 1000; o.maxTime = 3600; o.memoryMb = 256; o.stopWhenEmpty = false
@@ -170,7 +170,7 @@ job.
 
 ## Middleware
 
-```grav
+```typescript
 fn middleware() -> Array<JobMiddleware> {
     return [new RateLimitedJob("mailgun", 100, 60) as JobMiddleware,     // 100 a minute; the rest come back later
             new WithoutOverlapping("user:${self.userId}", 10),           // one at a time per user
@@ -216,7 +216,7 @@ When `queue.events` is set, the queue fires:
 
 ## Testing
 
-```grav
+```typescript
 queue.fake()
 code.thatDispatches()
 queue.assertPushed::<SendWelcome>()          queue.assertPushed::<SendWelcome>(2)
